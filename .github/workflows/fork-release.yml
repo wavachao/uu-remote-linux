@@ -1,0 +1,89 @@
+name: Fork release (Wayland/portal)
+
+# Merges the newest upstream tag into this fork, builds it with the Wayland/portal
+# backends and publishes a release. The host's update check reads the latest tag.
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '43 4 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fork-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    # libei >= 1.1 is required by the portal build; 22.04 ships an older one.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Merge the newest upstream tag into this fork
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/VallierDev/uu-remote-linux.git
+          git fetch upstream --tags --force
+          tag=$(git tag -l 'v*' --sort=-v:refname | head -n1)
+          test -n "$tag"
+          echo "Newest upstream tag: $tag"
+          # A conflict stops the job instead of publishing an untested merge.
+          git merge --no-edit "$tag"
+      - name: Read the package version
+        id: version
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
+          test -n "$version"
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+          echo "Release tag: v$version"
+      - name: Check whether this release already exists
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "${{ steps.version.outputs.tag }}" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Install build dependencies
+        if: steps.release.outputs.exists == 'false'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config \
+            libx11-dev libxext-dev libxtst-dev libxfixes-dev libgtk-3-dev ffmpeg \
+            libwayland-dev libxkbcommon-dev wl-clipboard \
+            libglib2.0-dev libpipewire-0.3-dev libei-dev
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.release.outputs.exists == 'false'
+      - name: Build
+        if: steps.release.outputs.exists == 'false'
+        run: cargo build --release --locked --features wayland,portal
+      - name: Package and publish
+        if: steps.release.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${{ steps.version.outputs.tag }}"
+          name="uu-remote-linux-${tag}-x86_64-linux-wayland-portal"
+          mkdir -p "$name"
+          cp target/release/uuremote-server LICENSE README.md README.en.md config.example.json "$name/"
+          cp -r contrib "$name/"
+          tar czf "$name.tar.gz" "$name"
+          sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
+          git push origin HEAD:main
+          notes="docs/release-notes/${tag}.md"
+          if [ -f "$notes" ]; then
+            gh release create "$tag" "$name.tar.gz" "$name.tar.gz.sha256" \
+              --title "UU Remote Linux ${tag} (Wayland/portal)" --notes-file "$notes" --target main
+          else
+            gh release create "$tag" "$name.tar.gz" "$name.tar.gz.sha256" \
+              --title "UU Remote Linux ${tag} (Wayland/portal)" \
+              --notes "Automated build with \`--features wayland,portal\` for GNOME/KDE Wayland." --target main
+          fi

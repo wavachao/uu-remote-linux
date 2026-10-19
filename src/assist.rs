@@ -68,7 +68,7 @@ fn valid_custom(code: &str) -> bool {
         && code.bytes().any(|b| b.is_ascii_alphabetic()) && code.bytes().any(|b| b.is_ascii_digit())
 }
 
-pub enum Command { Allow, Deny, Reset, Stop, Verify(Verify), Refresh(Refresh), Custom(String), Logout, Quit }
+pub enum Command { Allow, Deny, Reset, Stop, Verify(Verify), Refresh(Refresh), Custom(String), Logout, Quit, Update }
 
 #[cfg(uu_gtk)]
 extern "C" {
@@ -77,6 +77,7 @@ extern "C" {
     fn uu_ui_set_user(name: *const libc::c_char);
     fn uu_assist_ui_set(id: *const libc::c_char, code: *const libc::c_char, allowed: libc::c_int, verify: libc::c_int, refresh: libc::c_int, has_custom: libc::c_int);
     fn uu_assist_ui_take_command(arg: *mut libc::c_char, len: libc::size_t) -> libc::c_int;
+    fn uu_assist_ui_set_update_status(text: *const libc::c_char);
     fn uu_assist_ui_close();
 }
 
@@ -124,6 +125,15 @@ impl LocalUi {
         #[cfg(uu_gtk)]
         if matches!(self, Self::Window) { unsafe { uu_assist_ui_present() } }
     }
+    /// Manual update check result beside the 检查更新 button.
+    pub fn set_update_status(&self, text: &str) {
+        #[cfg(uu_gtk)]
+        if matches!(self, Self::Window) {
+            let text = std::ffi::CString::new(text).unwrap_or_default();
+            unsafe { uu_assist_ui_set_update_status(text.as_ptr()) }
+        }
+        #[cfg(not(uu_gtk))] let _ = text;
+    }
     fn show(&self, id: &str, code: &str, allowed: bool, verify: Verify, refresh: Refresh, has_custom: bool) -> Result<(), String> {
         #[cfg(not(uu_gtk))] let _ = has_custom;
         match self {
@@ -157,6 +167,7 @@ impl LocalUi {
                     7 => return Command::Custom(text),
                     8 => return Command::Logout,
                     9 => return Command::Quit,
+                    10 => return Command::Update,
                     _ => tokio::time::sleep(std::time::Duration::from_millis(150)).await,
                 }
             },

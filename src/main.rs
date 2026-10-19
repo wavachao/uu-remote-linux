@@ -11,6 +11,7 @@ mod wayland;
 mod auth;
 mod assist;
 mod config;
+mod update_check;
 mod login;
 mod login_ui;
 mod session_lock;
@@ -408,6 +409,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     virtual_audio::init();
     let _audio_cleanup=virtual_audio::Cleanup;
     log::info!("Starting uu-remote-linux host v{}...", env!("CARGO_PKG_VERSION"));
+    update_check::spawn();
 
     let capture = Arc::new((if desktop_backend::headless() {
         Err("headless mode (UU_DESKTOP_BACKEND=none)".to_owned())
@@ -626,6 +628,17 @@ async fn serve(mut capture: Arc<ScreenCapture>, input: Arc<InputInjector>, shutd
                     }
                 }
                 SignalingEvent::AssistCommand(assist::Command::Reset) => { if let Some(s) = assist.as_mut() { s.reset()?; } }
+                SignalingEvent::AssistCommand(assist::Command::Update) => {
+                    let ui = assist.as_ref().map(|s| s.ui());
+                    tokio::spawn(async move {
+                        let text = match update_check::check_now().await {
+                            Ok(Some(tag)) => format!("发现新版本 {tag}"),
+                            Ok(None) => "已是最新版本".to_owned(),
+                            Err(error) => { log::debug!("Update check failed: {error}"); "检查失败".to_owned() }
+                        };
+                        if let Some(ui) = ui { ui.set_update_status(&text); }
+                    });
+                }
                 SignalingEvent::AssistTick => {
                     let mut sessions = webrtc_sessions.lock().await;
                     let ended: Vec<_> = sessions.iter().filter(|(_, s)| matches!(s.pc.connection_state(),

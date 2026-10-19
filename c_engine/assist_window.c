@@ -28,7 +28,7 @@ static const char *CSS =
     ".status.ok { color: #16a34a; }\n"
     ".status.error { color: #dc2626; }\n";
 
-enum { CMD_NONE = 0, CMD_ALLOW = 1, CMD_DENY = 2, CMD_RESET = 3, CMD_STOP = 4, CMD_VERIFY = 5, CMD_REFRESH = 6, CMD_CUSTOM = 7, CMD_LOGOUT = 8, CMD_QUIT = 9 };
+enum { CMD_NONE = 0, CMD_ALLOW = 1, CMD_DENY = 2, CMD_RESET = 3, CMD_STOP = 4, CMD_VERIFY = 5, CMD_REFRESH = 6, CMD_CUSTOM = 7, CMD_LOGOUT = 8, CMD_QUIT = 9, CMD_UPDATE = 10 };
 enum { VERIFY_TEMPORARY = 0, VERIFY_CUSTOM = 1, VERIFY_BOTH = 2 };
 
 typedef struct { char *id; char *code; int allowed, verify, refresh, has_custom; } State;
@@ -44,7 +44,7 @@ static int ui_started, init_state; // 0 pending, 1 ok, -1 failed
 static pthread_mutex_t init_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t init_cond = PTHREAD_COND_INITIALIZER;
 static GtkWidget *window, *allow_switch, *id_label, *code_label, *eye_button, *share_button, *hint_label, *verify_combo, *note_label;
-static GtkWidget *refresh_items[5], *footer_label;
+static GtkWidget *refresh_items[5], *footer_label, *update_label;
 // Account card: QR login before sign-in, user info (+ logout) after.
 static GtkWidget *assist_card, *account_card, *account_stack, *qr_stack, *qr_image, *login_status, *user_label;
 static int show_assist = 1, show_account;
@@ -171,6 +171,12 @@ static gboolean on_switch(GtkSwitch *s, gboolean state, gpointer d) {
     (void)s; (void)d;
     if (!suppress_switch) post(state ? CMD_ALLOW : CMD_DENY);
     return FALSE;
+}
+
+static void on_check_update(GtkButton *b, gpointer d) {
+    (void)b; (void)d;
+    gtk_label_set_text(GTK_LABEL(update_label), "检查中…");
+    post(CMD_UPDATE);
 }
 
 // Host service: the close button only hides the window (assistance keeps its own on/off switch).
@@ -460,8 +466,17 @@ static void build_window(void) {
     account_card = build_account_card();
     gtk_widget_set_margin_top(account_card, 6);
     gtk_box_pack_start(GTK_BOX(root), account_card, FALSE, FALSE, 0);
+    GtkWidget *footer_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
     footer_label = label("开源 Linux 被控端 · 非网易官方客户端 · 关闭窗口即停止远程协助", "footer");
-    gtk_box_pack_end(GTK_BOX(root), footer_label, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(footer_row), footer_label, TRUE, TRUE, 0);
+    GtkWidget *update_button = gtk_button_new_with_label("检查更新");
+    gtk_style_context_add_class(gtk_widget_get_style_context(update_button), "flat");
+    g_signal_connect(update_button, "clicked", G_CALLBACK(on_check_update), NULL);
+    gtk_box_pack_end(GTK_BOX(footer_row), update_button, FALSE, FALSE, 0);
+    update_label = label("", "footer");
+    gtk_widget_set_valign(update_label, GTK_ALIGN_CENTER);
+    gtk_box_pack_end(GTK_BOX(footer_row), update_label, FALSE, FALSE, 0);
+    gtk_box_pack_end(GTK_BOX(root), footer_row, FALSE, FALSE, 0);
     if (close_hides) gtk_label_set_text(GTK_LABEL(footer_label), "开源 Linux 被控端 · 非网易官方客户端 · 关闭窗口后远程协助仍在后台运行");
     render_code();
     if (close_hides) build_tray();
@@ -558,6 +573,17 @@ void uu_assist_ui_set(const char *id, const char *code, int allowed, int verify,
     s->id = g_strdup(id ? id : ""); s->code = g_strdup(code ? code : ""); s->allowed = allowed;
     s->verify = verify; s->refresh = refresh; s->has_custom = has_custom;
     g_idle_add(apply_state, s);
+}
+
+static gboolean apply_update_status(gpointer data) {
+    char *text = data;
+    if (window && update_label) gtk_label_set_text(GTK_LABEL(update_label), text);
+    g_free(text);
+    return G_SOURCE_REMOVE;
+}
+void uu_assist_ui_set_update_status(const char *text) {
+    if (!ui_started || init_state != 1) return;
+    g_idle_add(apply_update_status, g_strdup(text ? text : ""));
 }
 
 // Pops the next user command (see CMD_*), copying its argument into arg.
