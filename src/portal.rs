@@ -119,7 +119,7 @@ mod native {
             let (mut error, mut width, mut height) = (0, 0, 0);
             let directory = super::permissions::directory();
             let key = super::permissions::desktop_key();
-            let token = directory.as_deref().and_then(|dir| super::permissions::take(dir, key))
+            let token = directory.as_deref().and_then(|dir| super::permissions::load(dir, key))
                 .and_then(|value| std::ffi::CString::new(value).ok());
             let mut cache = (directory, key);
             extern "C" fn save_token(token: *const libc::c_char, data: *mut c_void) {

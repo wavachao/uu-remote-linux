@@ -305,6 +305,21 @@ impl WebRtcSession {
         if desktop && !cfg!(test) {
             let state_pc = streaming_pc.clone();
             tokio::spawn(async move {
+                // Keep GNOME from auto-locking while a desktop viewer is connected;
+                // a manual lock still works and disconnecting releases the inhibitor.
+                struct Inhibitor(Option<crate::desktop_power::IdleInhibitor>);
+                impl Drop for Inhibitor {
+                    fn drop(&mut self) {
+                        if let Some(inhibitor) = self.0.take() { tokio::task::spawn_blocking(move || drop(inhibitor)); }
+                    }
+                }
+                let _inhibitor = if stream_desktop.is_some() {
+                    match tokio::task::spawn_blocking(crate::desktop_power::IdleInhibitor::acquire).await {
+                        Ok(Ok(inhibitor)) => Inhibitor(Some(inhibitor)),
+                        Ok(Err(error)) => { log::warn!("Desktop idle inhibition unavailable: {error}"); Inhibitor(None) }
+                        Err(_) => Inhibitor(None),
+                    }
+                } else { Inhibitor(None) };
                 let screen = if let Some(desktop) = stream_desktop {
                     if let Err(error) = crate::locked_video::run(&streaming_pc, &video_track, &desktop).await {
                         log::warn!("Locked desktop video unavailable: {error}");

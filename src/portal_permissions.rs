@@ -1,4 +1,7 @@
-//! Single-use Portal permissions. Never log the token or reuse it after an attempt.
+//! Persisted Portal restore token. Never log it. The token survives failed or
+//! cancelled opens (e.g. a recovery racing the lock) so the next attempt can
+//! reuse the remembered permission instead of asking for consent again; a
+//! successful open replaces it with the portal's new token.
 use std::{fs::{self, OpenOptions}, io::{Read, Write}, path::{Path, PathBuf}};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
@@ -23,15 +26,15 @@ pub fn desktop_key() -> &'static str {
     if desktop.split(':').any(|v| v == "kde") { "kde" } else { "gnome" }
 }
 
-pub fn take(dir: &Path, key: &str) -> Option<String> {
+pub fn load(dir: &Path, key: &str) -> Option<String> {
     let path = dir.join(key);
     let mut file = OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(&path).ok()?;
     let meta = file.metadata().ok()?;
     if !meta.is_file() || meta.uid() != unsafe { libc::getuid() } || meta.mode() & 0o077 != 0 || meta.len() > 4096 { return None; }
     let mut token = String::new();
     file.read_to_string(&mut token).ok()?;
-    // Consume before contacting the Portal: a timeout may still consume the upstream token.
-    fs::remove_file(path).ok()?;
+    // Keep the file: an invalid token only makes the portal prompt again, while
+    // deleting it on a failed attempt loses the remembered permission for good.
     (!token.is_empty() && !token.contains('\0')).then_some(token)
 }
 
@@ -55,16 +58,20 @@ pub fn save(dir: &Path, key: &str, token: &str) -> std::io::Result<()> {
 mod tests {
     use super::*;
     #[test]
-    fn permissions_are_private_single_use_and_reject_symlinks() {
+    fn permissions_are_private_persistent_and_reject_symlinks() {
         let dir = std::env::temp_dir().join(format!("uu-portal-cache-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         save(&dir, "kde", "test-token").unwrap();
         assert_eq!(fs::metadata(dir.join("kde")).unwrap().mode() & 0o777, 0o600);
-        assert_eq!(take(&dir, "kde").as_deref(), Some("test-token"));
-        assert!(take(&dir, "kde").is_none());
+        assert_eq!(load(&dir, "kde").as_deref(), Some("test-token"));
+        // A failed open must leave the token for the next attempt.
+        assert_eq!(load(&dir, "kde").as_deref(), Some("test-token"));
+        save(&dir, "kde", "next-token").unwrap();
+        assert_eq!(load(&dir, "kde").as_deref(), Some("next-token"));
         save(&dir, "gnome", "second-token").unwrap();
+        fs::remove_file(dir.join("kde")).unwrap();
         std::os::unix::fs::symlink(dir.join("gnome"), dir.join("kde")).unwrap();
-        assert!(take(&dir, "kde").is_none());
+        assert!(load(&dir, "kde").is_none());
         assert!(save(&dir, "gnome", &"x".repeat(4097)).is_err());
         fs::remove_dir_all(dir).unwrap();
     }
