@@ -47,7 +47,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          if gh release view "${{ steps.version.outputs.tag }}" >/dev/null 2>&1; then
+          # gh treats the "upstream" remote as the base repo in a fork; pin this repo.
+          if gh release view "${{ steps.version.outputs.tag }}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
             echo "exists=true" >> "$GITHUB_OUTPUT"
           else
             echo "exists=false" >> "$GITHUB_OUTPUT"
@@ -81,9 +82,11 @@ jobs:
           notes="docs/release-notes/${tag}.md"
           if [ -f "$notes" ]; then
             gh release create "$tag" "$name.tar.gz" "$name.tar.gz.sha256" \
+              --repo "${{ github.repository }}" \
               --title "UU Remote Linux ${tag} (Wayland/portal)" --notes-file "$notes" --target main
           else
             gh release create "$tag" "$name.tar.gz" "$name.tar.gz.sha256" \
+              --repo "${{ github.repository }}" \
               --title "UU Remote Linux ${tag} (Wayland/portal)" \
               --notes "Automated build with \`--features wayland,portal\` for GNOME/KDE Wayland." --target main
           fi
