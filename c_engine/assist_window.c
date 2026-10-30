@@ -184,7 +184,7 @@ static gboolean on_switch(GtkSwitch *s, gboolean state, gpointer d) {
 
 static void on_check_update(GtkButton *b, gpointer d) {
     (void)b; (void)d;
-    gtk_label_set_text(GTK_LABEL(update_label), "检查中…");
+    gtk_label_set_text(GTK_LABEL(update_label), L("检查中…", "Checking…"));
     post(CMD_UPDATE);
 }
 

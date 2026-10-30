@@ -886,9 +886,9 @@ async fn serve(mut capture: Arc<ScreenCapture>, input: Arc<InputInjector>, shutd
                     let ui = assist.as_ref().map(|s| s.ui());
                     tokio::spawn(async move {
                         let text = match update_check::check_now().await {
-                            Ok(Some(tag)) => format!("发现新版本 {tag}"),
-                            Ok(None) => "已是最新版本".to_owned(),
-                            Err(error) => { log::debug!("Update check failed: {error}"); "检查失败".to_owned() }
+                            Ok(Some(tag)) => crate::tr!("发现新版本 {tag}", "New version available: {tag}"),
+                            Ok(None) => crate::i18n::s("已是最新版本", "Up to date").to_owned(),
+                            Err(error) => { log::debug!("Update check failed: {error}"); crate::i18n::s("检查失败", "Check failed").to_owned() }
                         };
                         if let Some(ui) = ui { ui.set_update_status(&text); }
                     });
