@@ -40,11 +40,13 @@ impl VideoCodec {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VideoSettings {
+    pub source_id: usize,
+    pub source_generation: u64,
     pub fps: u32,
     pub codec: VideoCodec,
     pub quality: u64,
-    /// Viewer max_custom_bitrate (only used for QUALITY_CUSTOM): Mbit/s, or kbit/s above 1000.
-    pub custom_mbps: u32,
+    /// Viewer max_custom_bitrate in bits/s (only used for QUALITY_CUSTOM).
+    pub custom_bps: u32,
     /// Scaled stream size (其他分辨率); None streams the native desktop size.
     pub output: Option<(u32, u32)>,
     /// CHROMA_420 or CHROMA_444 (真彩); 4:4:4 only when the encoder pipeline supports it.
@@ -52,7 +54,7 @@ pub struct VideoSettings {
 }
 
 impl Default for VideoSettings {
-    fn default() -> Self { Self { codec: VideoCodec::H264, fps: 60, quality: QUALITY_AUTO, custom_mbps: 0, output: None, chroma: CHROMA_420 } }
+    fn default() -> Self { let (source_id,source_generation)=crate::wayland::selection(); Self { source_id,source_generation, codec: VideoCodec::H264, fps: 60, quality: QUALITY_AUTO, custom_bps: 0, output: None, chroma: CHROMA_420 } }
 }
 
 /// Selectable smaller stream sizes with the desktop's aspect ratio (even dimensions).
@@ -84,8 +86,8 @@ impl VideoSettings {
             QUALITY_GENERAL => Some(2_000),
             QUALITY_HD => Some(8_000),
             QUALITY_BLURAY => Some(20_000),
-            QUALITY_CUSTOM if self.custom_mbps > 0 =>
-                Some(if self.custom_mbps > 1_000 { self.custom_mbps } else { self.custom_mbps * 1_000 }.min(100_000)),
+            QUALITY_CUSTOM if self.custom_bps > 0 =>
+                Some((self.custom_bps / 1_000).clamp(1, 100_000)),
             _ => None,
         }
     }
@@ -110,22 +112,67 @@ fn fps_from_option(value: u64) -> Option<u64> {
 
 /// Applies a capture-setting RPC to `settings` and returns the RpcResponse payload (Message 22),
 /// or None when the RPC is not a capture/fps/quality setting.
+/// max_custom_bitrate (field 8) in bit/s: the mobile viewer sends 1_000_000 for 1 Mbps (#67). Values
+/// that can only be a different unit stay usable instead of collapsing to a 1 kbit/s cap: below 1000
+/// they are Mbit/s, below 200_000 kbit/s (no viewer offers custom rates under 200 kbit/s).
+fn custom_bitrate_bps(value: u64) -> u32 {
+    let bps = if value < 1_000 { value * 1_000_000 } else if value < 200_000 { value * 1_000 } else { value };
+    bps.min(u64::from(u32::MAX)) as u32
+}
+
+#[cfg(test)]
 pub fn handle_rpc(rpc: &[WireField], settings: &watch::Sender<VideoSettings>, native: (u32, u32)) -> Option<Vec<u8>> {
     handle_rpc_with_codecs(rpc, settings, native, true, false)
 }
 
 /// Initial codec once the m-line is negotiated: H.265 when both sides support it (the Mac viewer
-/// lists H265 first in its offer), unless UU_VIDEO_CODEC=h264.
+/// lists H265 first in its offer) and a hardware encoder is selected. Software libx265 is about ten
+/// times slower than libx264 (measured 15 vs 155 fps at 1080p on a 4-core ARM host, #59), so CPU
+/// hosts default to H.264. UU_VIDEO_CODEC=h264 / h265 overrides.
+#[cfg(test)]
+fn test_selection() -> crate::video_select::Selection {
+    crate::video_select::resolve_pair(Some("auto"), None, Some("auto"), None, false, None)
+}
+
+#[cfg(test)]
 pub fn preferred_codec(h264: bool, h265: bool) -> VideoCodec {
-    let forced_h264 = std::env::var("UU_VIDEO_CODEC").is_ok_and(|v| v.eq_ignore_ascii_case("h264"));
-    if h265 && !(forced_h264 && h264) { VideoCodec::H265 } else { VideoCodec::H264 }
+    preferred_codec_for(h264, h265, test_selection())
 }
 
+pub fn preferred_codec_for(h264: bool, h265: bool, selection: crate::video_select::Selection) -> VideoCodec {
+    pick_codec(h264, h265, crate::video_select::codec_force(selection.codec_pref), crate::video_select::hardware(selection.encoder))
+}
+
+pub(crate) fn pick_codec(h264: bool, h265: bool, forced: Option<&str>, hardware: bool) -> VideoCodec {
+    let wants_h265 = match forced { Some("h264") => false, Some("h265" | "hevc") => true, _ => hardware };
+    if h265 && (wants_h265 || !h264) { VideoCodec::H265 } else { VideoCodec::H264 }
+}
+
+#[cfg(test)]
 pub fn handle_rpc_with_codecs(rpc: &[WireField], settings: &watch::Sender<VideoSettings>, native: (u32, u32), h264: bool, h265: bool) -> Option<Vec<u8>> {
-    apply_rpc(rpc, settings, native, h264, h265, crate::video::full_chroma_available())
+    handle_rpc_for(rpc, settings, native, h264, h265, test_selection())
 }
 
-fn apply_rpc(rpc: &[WireField], settings: &watch::Sender<VideoSettings>, native: (u32, u32), h264: bool, h265: bool, full_chroma: bool) -> Option<Vec<u8>> {
+pub fn handle_rpc_for(rpc: &[WireField], settings: &watch::Sender<VideoSettings>, native: (u32, u32), h264: bool, h265: bool, selection: crate::video_select::Selection) -> Option<Vec<u8>> {
+    apply_rpc(rpc, settings, native, h264, h265, crate::video::full_chroma_for(selection.encoder), crate::video_select::codec_force(selection.codec_pref))
+}
+
+/// The resolution a capture/resolution RPC asks for, parsed like apply_rpc: X11 hosts apply it
+/// to the display mode itself (desktop_mode), as the official Windows host changes its resolution.
+pub fn requested_resolution(rpc: &[WireField]) -> Option<crate::desktop_mode::Request> {
+    use crate::desktop_mode::Request;
+    if let Some(request) = message(rpc, 2) {
+        let fields = decode_wire(request).ok()?;
+        if number(&fields, 10) == Some(3) { return Some(Request::Native); }
+        let (w, h) = number(&fields, 16).zip(number(&fields, 17)).or_else(|| number(&fields, 5).zip(number(&fields, 6)))?;
+        Some(Request::Size(u32::try_from(w).ok()?, u32::try_from(h).ok()?))
+    } else if let Some(request) = message(rpc, 6) {
+        let fields = decode_wire(request).ok()?;
+        Some(Request::Size(u32::try_from(number(&fields, 1)?).ok()?, u32::try_from(number(&fields, 2)?).ok()?))
+    } else { None }
+}
+
+fn apply_rpc(rpc: &[WireField], settings: &watch::Sender<VideoSettings>, native: (u32, u32), _h264: bool, h265: bool, full_chroma: bool, forced: Option<&str>) -> Option<Vec<u8>> {
     let header = message(rpc, 1).unwrap_or(&[]);
     let mut next = *settings.borrow();
     if let Some(request) = message(rpc, 2) {
@@ -136,11 +183,13 @@ fn apply_rpc(rpc: &[WireField], settings: &watch::Sender<VideoSettings>, native:
         // codec_type 13 (1 H264, 2 H265): like the official host (negotiateCodec), the host picks the
         // codec from both capability lists; the Mac viewer sends its current codec (1 while receiving
         // H.264), so only an explicit H.265 request switches, never one absent from the m-line.
-        if number(&fields, 13) == Some(2) && h265 { next.codec = VideoCodec::H265; }
+        // A forced codec (host_settings video_codec or UU_VIDEO_CODEC) wins over that switch, same
+        // rule as pick_codec at stream start: h264 stays H.264; auto/h265 still follow the request.
+        if number(&fields, 13) == Some(2) && h265 && forced != Some("h264") { next.codec = VideoCodec::H265; }
         // Field 1 is the viewer's fps option index (1 = 30, 2 = 60, ...); 18 fpsCount is the frame rate.
         if let Some(fps) = number(&fields, 18).filter(|v| *v > 0).or_else(|| number(&fields, 1).and_then(fps_from_option)) { next.fps = fps as u32; }
         if let Some(quality) = number(&fields, 2).filter(|v| *v > 0) { next.quality = quality; }
-        if let Some(bitrate) = number(&fields, 8).filter(|v| *v > 0) { next.custom_mbps = bitrate as u32; }
+        if let Some(bitrate) = number(&fields, 8).filter(|v| *v > 0) { next.custom_bps = custom_bitrate_bps(bitrate); }
         // Field 7 chorma_format (sic): 3 = 4:4:4 when 真彩 is on, 1 = 4:2:0. The Sync reports what is encoded.
         match number(&fields, 7) {
             Some(CHROMA_444) if full_chroma => next.chroma = CHROMA_444,
@@ -180,9 +229,37 @@ fn apply_rpc(rpc: &[WireField], settings: &watch::Sender<VideoSettings>, native:
     Some(out)
 }
 
+/// CaptureSettingResponse.errors (Error fields 1 code / 2 message, rpc_main.proto).
+pub fn rejected_request(data:&[u8],reason:&str)->Option<Vec<u8>> {
+    let outer=decode_wire(data).ok()?;
+    let rpc=decode_wire(message(&outer,21)?).ok()?;
+    message(&rpc,2)?;
+    let mut error=Vec::new();
+    put_varint(1,(-1i64) as u64,&mut error);
+    put_bytes(2,reason.as_bytes(),&mut error);
+    let mut errors=Vec::new();put_bytes(1,&error,&mut errors);
+    let mut response=Vec::new();
+    put_bytes(1,message(&rpc,1).unwrap_or(&[]),&mut response);
+    put_bytes(2,&errors,&mut response);
+    Some(response)
+}
+
 /// Message 7 ScreenSources in pixels for capture-setting v4: native, choices, current size.
 pub fn screen_sources(seq: u64, timestamp: u64, native: (u32, u32), output: Option<(u32, u32)>, name: &str) -> Result<Vec<u8>, String> {
     use crate::initialization::{Screen, WinRect};
+    let outputs=crate::wayland::outputs();
+    if !outputs.is_empty() {
+        let current=crate::wayland::selected();
+        let choices:Vec<Vec<(i32,i32)>>=outputs.iter().map(|m|scaled_sizes((m.width,m.height)).into_iter().map(|(w,h)|(w as i32,h as i32)).collect()).collect();
+        let screens:Vec<Screen<'_>>=outputs.iter().enumerate().map(|(id,m)| Screen {
+            id:id as i32, fps:m.fps,
+            resolution:WinRect {left:0,top:0,width:m.width as i32,height:m.height as i32,pixel_width:m.width as i32,pixel_height:m.height as i32},
+            primary:id==0,dpr:1.0,display_name:&m.name,video_track_index:if id==current {0} else {-1},
+            screen_type:0,builtin_screen_type:if m.name.starts_with("eDP") {1} else {2},scaled:&choices[id],
+            current:if id==current {output.map(|(w,h)|(w as i32,h as i32))} else {None},
+        }).collect();
+        return crate::initialization::encode_screen_sources(seq,timestamp,&screens,current as i32);
+    }
     let (w, h) = (native.0 as i32, native.1 as i32);
     let scaled: Vec<(i32, i32)> = scaled_sizes(native).into_iter().map(|(w, h)| (w as i32, h as i32)).collect();
     // DPI_SCALE starts at version 5; the observed v4 request uses fields 5/6 as pixels.
@@ -201,7 +278,7 @@ pub fn sync_payload(settings: &VideoSettings, native: (u32, u32)) -> Vec<u8> {
     put_varint(1, u64::from(settings.fps), &mut out);
     put_varint(2, settings.quality, &mut out);
     put_varint(3, settings.chroma, &mut out);
-    if settings.custom_mbps > 0 { put_varint(4, u64::from(settings.custom_mbps), &mut out); }
+    if settings.custom_bps > 0 { put_varint(4, u64::from(settings.custom_bps), &mut out); }
     put_varint(5, u64::from(size.0), &mut out);
     put_varint(6, u64::from(size.1), &mut out);
     put_varint(9, u64::from(size.0), &mut out);
@@ -248,7 +325,7 @@ mod tests {
         put_varint(18, 30, &mut body);
         let request = rpc(77, 2, &body);
         let response = handle_rpc(&decode_wire(&request).unwrap(), &tx, (1920, 1080)).unwrap();
-        assert_eq!(*rx.borrow(), VideoSettings { codec: VideoCodec::H264, fps: 30, quality: QUALITY_GENERAL, custom_mbps: 0, output: None, chroma: CHROMA_420 });
+        assert_eq!(*rx.borrow(), VideoSettings { source_id:0,source_generation:0, codec: VideoCodec::H264, fps: 30, quality: QUALITY_GENERAL, custom_bps: 0, output: None, chroma: CHROMA_420 });
         assert_eq!(rx.borrow().max_kbps(), Some(2_000));
         let fields = decode_wire(&response).unwrap();
         assert_eq!(message(&fields, 1), Some(&[8u8, 77][..]));
@@ -274,12 +351,12 @@ mod tests {
         let (tx, rx) = watch::channel(VideoSettings::default());
         // Observed Mac viewer request with 真彩 on: field 7 = 3.
         let request = rpc(5, 2, &[8, 2, 16, 4, 56, 3, 144, 1, 60]);
-        apply_rpc(&decode_wire(&request).unwrap(), &tx, (1920, 1080), true, false, false).unwrap();
+        apply_rpc(&decode_wire(&request).unwrap(), &tx, (1920, 1080), true, false, false, None).unwrap();
         assert_eq!(rx.borrow().chroma, CHROMA_420);
-        apply_rpc(&decode_wire(&request).unwrap(), &tx, (1920, 1080), true, false, true).unwrap();
+        apply_rpc(&decode_wire(&request).unwrap(), &tx, (1920, 1080), true, false, true, None).unwrap();
         assert_eq!(rx.borrow().chroma, CHROMA_444);
         assert_eq!(number(&decode_wire(&sync_payload(&rx.borrow(), (1920, 1080))).unwrap(), 3), Some(CHROMA_444));
-        apply_rpc(&decode_wire(&rpc(6, 2, &[56, 1])).unwrap(), &tx, (1920, 1080), true, false, true).unwrap();
+        apply_rpc(&decode_wire(&rpc(6, 2, &[56, 1])).unwrap(), &tx, (1920, 1080), true, false, true, None).unwrap();
         assert_eq!(rx.borrow().chroma, CHROMA_420);
     }
 
@@ -432,8 +509,40 @@ mod tests {
     #[test]
     fn auto_quality_keeps_constant_quality_encoding() {
         assert_eq!(VideoSettings::default().max_kbps(), None);
-        assert_eq!(VideoSettings { quality: QUALITY_CUSTOM, custom_mbps: 0, ..Default::default() }.max_kbps(), None);
-        assert_eq!(VideoSettings { quality: QUALITY_CUSTOM, custom_mbps: 12, ..Default::default() }.max_kbps(), Some(12_000));
+        assert_eq!(VideoSettings { quality: QUALITY_CUSTOM, custom_bps: 0, ..Default::default() }.max_kbps(), None);
+        assert_eq!(VideoSettings { quality: QUALITY_CUSTOM, custom_bps: 12_000_000, ..Default::default() }.max_kbps(), Some(12_000));
+    }
+
+    #[test]
+    fn mobile_custom_bitrate_is_bits_per_second_in_request_and_sync() {
+        // Mobile viewer sends field 8 = 1_000_000 for 1 Mbps (observed live, 2026-10-20).
+        for (bps, kbps) in [(1_000_000, 1_000), (30_000_000, 30_000), (500_000, 500), (100_000_000, 100_000), (200_000_000, 100_000)] {
+            let (tx, rx) = watch::channel(VideoSettings::default());
+            let mut body = Vec::new();
+            put_varint(2, QUALITY_CUSTOM, &mut body);
+            put_varint(8, bps, &mut body);
+            handle_rpc(&decode_wire(&rpc(7, 2, &body)).unwrap(), &tx, (1920, 1080)).unwrap();
+            assert_eq!(rx.borrow().max_kbps(), Some(kbps));
+            let sync = sync_payload(&rx.borrow(), (1920, 1080));
+            assert_eq!(number(&decode_wire(&sync).unwrap(), 4), Some(bps));
+        }
+    }
+
+    #[test]
+    fn small_custom_bitrates_are_read_as_larger_units() {
+        assert_eq!(custom_bitrate_bps(20), 20_000_000);
+        assert_eq!(custom_bitrate_bps(8_000), 8_000_000);
+        assert_eq!(custom_bitrate_bps(1_000_000), 1_000_000);
+    }
+
+    #[test]
+    fn oversized_custom_bitrate_does_not_wrap_before_encoder_limit() {
+        let (tx, rx) = watch::channel(VideoSettings::default());
+        let mut body = Vec::new();
+        put_varint(2, QUALITY_CUSTOM, &mut body);
+        put_varint(8, u64::from(u32::MAX) + 1, &mut body);
+        handle_rpc(&decode_wire(&rpc(8, 2, &body)).unwrap(), &tx, (1920, 1080)).unwrap();
+        assert_eq!(rx.borrow().max_kbps(), Some(100_000));
     }
 
     #[test]
@@ -468,5 +577,67 @@ mod codec_tests {
         handle_rpc_with_codecs(&rpc(1), &tx, (1920,1080), true, true).unwrap();
         assert_eq!(rx.borrow().codec, VideoCodec::H265);
         assert_eq!(preferred_codec(true, false), VideoCodec::H264);
+    }
+    #[test]
+    fn software_hosts_default_to_h264_unless_forced() {
+        assert_eq!(pick_codec(true, true, None, true), VideoCodec::H265);
+        assert_eq!(pick_codec(true, true, None, false), VideoCodec::H264);
+        assert_eq!(pick_codec(true, true, Some("h265"), false), VideoCodec::H265);
+        assert_eq!(pick_codec(true, true, Some("h264"), true), VideoCodec::H264);
+        // Only one codec bound in the SDP: use it whatever the preference.
+        assert_eq!(pick_codec(false, true, None, false), VideoCodec::H265);
+        assert_eq!(pick_codec(true, false, Some("h265"), true), VideoCodec::H264);
+    }
+    #[test]
+    fn forced_h264_ignores_later_h265_capture_request() {
+        let (tx, rx) = watch::channel(VideoSettings::default());
+        // Field 13 = 2 on a peer that negotiated both codecs.
+        let request = decode_wire(&[18, 2, 104, 2]).unwrap();
+        apply_rpc(&request, &tx, (1920, 1080), true, true, false, Some("h264")).unwrap();
+        assert_eq!(rx.borrow().codec, VideoCodec::H264);
+        apply_rpc(&request, &tx, (1920, 1080), true, true, false, None).unwrap();
+        assert_eq!(rx.borrow().codec, VideoCodec::H265);
+        let (tx, rx) = watch::channel(VideoSettings::default());
+        apply_rpc(&request, &tx, (1920, 1080), true, true, false, Some("h265")).unwrap();
+        assert_eq!(rx.borrow().codec, VideoCodec::H265);
+    }
+    #[test]
+    fn true_color_keeps_codec_and_vaapi_reports_420() {
+        // Field 7 = 3 (真彩). full_chroma false is the VAAPI 4:2:0 drop; true encodes 4:4:4.
+        let request = decode_wire(&[18, 2, 56, 3]).unwrap();
+        let (tx, rx) = watch::channel(VideoSettings { codec: VideoCodec::H265, ..Default::default() });
+        apply_rpc(&request, &tx, (1920, 1080), true, true, true, None).unwrap();
+        assert_eq!((rx.borrow().chroma, rx.borrow().codec), (CHROMA_444, VideoCodec::H265));
+        // NVENC session (full chroma) that already chose H.265 stays H.265 when 真彩 is requested.
+        let nvenc = crate::video_select::resolve_pair(None, None, None, None, true, None);
+        assert_eq!(nvenc.encoder, crate::video::Encoder::Nvenc);
+        let (tx, rx) = watch::channel(VideoSettings { codec: preferred_codec_for(true, true, nvenc), ..VideoSettings::default() });
+        assert_eq!(rx.borrow().codec, VideoCodec::H265);
+        handle_rpc_for(&request, &tx, (1920, 1080), true, true, nvenc).unwrap();
+        assert_eq!((rx.borrow().chroma, rx.borrow().codec), (CHROMA_444, VideoCodec::H265));
+        let (tx, rx) = watch::channel(VideoSettings { codec: VideoCodec::H265, ..Default::default() });
+        apply_rpc(&request, &tx, (1920, 1080), true, true, false, None).unwrap();
+        assert_eq!((rx.borrow().chroma, rx.borrow().codec), (CHROMA_420, VideoCodec::H265));
+        assert_eq!(number(&decode_wire(&sync_payload(&rx.borrow(), (1920, 1080))).unwrap(), 3), Some(CHROMA_420));
+        assert!(decode_wire(&sync_payload(&rx.borrow(), (1920, 1080))).unwrap().iter().all(|f| f.number != 13));
+    }
+}
+
+#[cfg(test)]
+mod screen_error_tests {
+    use super::*;
+    #[test]
+    fn failed_switch_returns_correlated_error_not_success() {
+        let header=[10,4,b't',b'e',b's',b't'];
+        let mut rpc=Vec::new();put_bytes(1,&header,&mut rpc);put_bytes(2,&[32,99],&mut rpc);
+        let request=crate::initialization::envelope(1,2,21,&rpc);
+        let response=rejected_request(&request,"Unknown screen").unwrap();
+        let fields=decode_wire(&response).unwrap();
+        assert_eq!(message(&fields,1),Some(header.as_slice()));
+        let result=decode_wire(message(&fields,2).unwrap()).unwrap();
+        let error=decode_wire(message(&result,1).unwrap()).unwrap();
+        assert_eq!(number(&error,1),Some(u64::MAX));
+        assert_eq!(message(&error,2),Some(b"Unknown screen".as_slice()));
+        assert!(rejected_request(b"invalid","failure").is_none());
     }
 }

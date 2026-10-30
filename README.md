@@ -19,6 +19,21 @@
 <p align="center"><img src="docs/images/main-window.png" width="620" alt="Linux 主机主窗口：远程协助与账号"></p>
 <p align="center"><sub>Linux 被控端主窗口：远程协助与账号（设备 ID、验证码和账号已打码）</sub></p>
 
+## 语言 / Language
+
+启动时按以下顺序确定界面语言：
+
+1. `UU_LANG=zh` 或 `UU_LANG=en`；
+2. 控制端 **设置 → 常规 → 语言 / Language** 或主机主窗口底部「语言 / Language」中保存的选择（保存在 `~/.config/uuremote/language`，重启后生效）；
+3. 系统区域设置：`LC_ALL` / `LC_MESSAGES` / `LANG` 以 `zh` 开头为中文，其余为英文。
+
+```sh
+UU_LANG=zh uuremote-viewer ui
+UU_LANG=en uuremote-server
+```
+
+协议字段以及 UU 服务器返回的提示按服务器原文显示。
+
 <!-- 截图占位：在官方客户端里远控 Linux 桌面的效果图。请自行截图并去掉账号、设备名等信息后放到
      docs/images/remote-desktop.png，再取消下面这行的注释。注意不要截入网易的图标和品牌素材。 -->
 <!-- <p align="center"><img src="docs/images/remote-desktop.png" width="720" alt="用官方 Mac 客户端远控 Linux 桌面"></p> -->
@@ -39,8 +54,8 @@
 | 鼠标 / 键盘 | 绝对/相对移动、点击、滚轮、按键；修复了网络延迟导致的按键连发；Wayland 下可用 uinput 虚拟键鼠（不依赖键盘布局，见下文） |
 | Mac 快捷键 | **推荐**：在 Mac 远控窗口菜单里关闭「使用 macOS 快捷键」，之后和在 Mac 上一样：Cmd+C/V/A/F/X/Z 是复制、粘贴、全选、查找、剪切、撤销（终端里 Cmd+C/V 自动变成 Ctrl+Shift+C/V），Ctrl+C 在终端里始终是中断。保持开启时，客户端会把 Cmd 和 Ctrl 都当成 Ctrl 发送：终端里 Ctrl+V / Cmd+V 自动转成粘贴，Ctrl+C 是中断，复制用 Cmd+Shift+C（X11） |
 | 鼠标指针样式 | 远端指针形状实时同步（X11） |
-| 剪贴板 | 双向文本同步 |
-| 画质 / 帧率 / 分辨率 | 自动、原画 20M、超清 8M、高清 2M、自定义；30/60/90/144 帧；「其他分辨率」由编码器缩放，不改动主机显示器 |
+| 剪贴板 | 双向文本同步；Wayland 手机输入法输入通过剪贴板兜底粘贴，见下文 |
+| 画质 / 帧率 / 分辨率 | 自动、原画 20M、超清 8M、高清 2M、自定义；30/60/90/144 帧；X11 下切换分辨率会像官方 Windows 被控端一样真正修改桌面分辨率（xrandr，缺少该模式时自动添加；选「原始」或断开后恢复），`UU_DESKTOP_RESIZE=0` 改为仅由编码器缩放；Wayland 仍由编码器缩放 |
 | 声音 | 采集系统声音（PulseAudio / PipeWire），Opus 编码传到控制端 |
 | 文件传输 | 上传、下载（含文件夹）、新建文件夹、重命名、删除 |
 | 终端 | 官方「终端」工具，PTY 会话，支持多会话和重命名 |
@@ -65,12 +80,19 @@ Portal 仅作用于本服务获授权的会话。文件传输、终端等独立�
 | Xfce | X11 | ✅ 虚拟机测试通过 | 默认 |
 | Cinnamon / MATE | X11 | ✅ 虚拟机测试通过 | 默认 |
 | Hyprland | Wayland（wlroots 原生协议） | 🧪 实验性，虚拟机测试（部分功能受限，见下） | `--features wayland` |
+| niri | Wayland（wlroots 原生协议） | 🧪 实验性，采集、文字输入及竖屏切换已实机验收，其余待验证（#55） | `--features wayland` |
 | GNOME / KDE Plasma | Wayland（xdg-desktop-portal） | 🧪 实验性，验证范围与限制见下 | `--features wayland,portal` |
 
-GNOME Wayland 的 Portal/EIS 路径已在 Ubuntu 26.04、GNOME 50、单屏 4K/200% 缩放下验证画面和键鼠；锁屏冷连接自动解锁已用 Mac 和 iPhone 4.42.0 客户端实机验证，其余锁屏恢复及重连仍待验收。除 GNOME 的上述路径和 X11 外，其余桌面目前主要在虚拟机里测试。如果你在真机上遇到问题，欢迎[提交 issue](../../issues)，
-请附上发行版、桌面环境、显卡型号和 `journalctl --user -u uuremote-native.service` 里的相关日志。
+最后一列是源码编译方式；Release 预编译包已包含全部后端，直接使用即可（见[安装](#0-直接用-release-预编译包推荐x86_64)）。
 
-Wayland 下的限制：只支持单屏、固定分辨率；Hyprland 原生后端默认使用双缓冲流水线 shm screencopy，控制端帧率设置会同步到采集节拍和编码器，但实际帧率仍受合成器、渲染和读回速度限制（旧串行路径在 2560x1600 曾测得约 16～22 帧；流水线只在虚拟机里测量过，不代表实机保证）；portal 后端暂不支持动态分辨率；GNOME 的屏幕唤醒与锁屏恢复见下；剪贴板只在控制端的远控窗口处于前台时同步。
+GNOME Wayland 的 Portal/EIS 路径已在 Ubuntu 26.04、GNOME 50、单屏 4K/200% 缩放下验证画面和键鼠；锁屏冷连接自动解锁已用 Mac 和 iPhone 4.42.0 客户端实机验证，其余锁屏恢复及重连仍待验收。除 GNOME 的上述路径和 X11 外，其余桌面目前主要在虚拟机里测试。如果你在真机上遇到问题，欢迎[提交 issue](../../issues)，
+请附上 `uuremote-server doctor` 的输出（v0.2.17 起；只含会话、后端、插件、权限、编码器等状态，不含账号、令牌或地址，可直接粘贴）和 `journalctl --user -u uuremote-native.service` 里的相关日志。
+
+Wayland 下的限制：默认采集单屏，Hyprland 可按上文启用切屏；分辨率固定；Hyprland 原生后端默认使用双缓冲流水线 shm screencopy，控制端帧率设置会同步到采集节拍和编码器，但实际帧率仍受合成器、渲染和读回速度限制（旧串行路径在 2560x1600 曾测得约 16～22 帧；流水线只在虚拟机里测量过，不代表实机保证）；portal 后端暂不支持动态分辨率；GNOME 的屏幕唤醒与锁屏恢复见下；剪贴板只在控制端的远控窗口处于前台时同步。
+
+**手机控制端触控（GNOME）**：Android/iOS 控制端在触控模式下把手指当作左键拖动发送，在桌面上会选中文字。Portal 后端下被控端按每次按下判断：0.45 秒内移动超过几个像素即平滑滚动（`NotifyPointerAxis`，内容跟随手指，终端里同样有效，最后一个事件让客户端可以惯性滑动）；按住不动则像鼠标拖动一样选中；短按为点击。此模式无需触摸屏授权。`UU_TOUCH_INPUT=touch` 改为把拖动按单指触控在 Portal 触摸屏上重放，门户提供触摸屏设备类型时被控端会一并申请；此前保存的授权只恢复键盘和指针，因此第一次拖动时会在后台再申请一次（GNOME 共享对话框，手机画面中也能看到，授权超时后自动关闭），同意同一显示器后无需重连即切换为触控。不会预先删除已保存的授权，每次运行最多申请一次。`UU_TOUCH_INPUT=0` 保持鼠标拖动。
+
+**Wayland 手机输入法打字与剪贴板**：Wayland 下手机端输入法提交的文字（`text_input`）优先通过虚拟键盘空闲键码上屏；GNOME（Portal）下，当前输入源为拉丁 xkb 布局时，可打印 ASCII 直接以 keysym 输入（由 Mutter 选择按键和 Shift 层级）；其他文字、KDE 以及键码耗尽的环境自动通过「写系统剪贴板 + 触发 `Shift+Insert`（或 `UU_WAYLAND_PASTE_KEY=ctrl_v`）」兜底粘贴。VTE 终端的 `Shift+Insert` 粘贴的是 PRIMARY 选区，因此 ASCII 改为直接输入。**注意**：此兜底过程会覆盖被控端原有的剪贴板内容，且会被双向同步回传到控制端剪贴板；设置 `UU_WAYLAND_TEXT=0` 可完全关闭 Wayland 文字输入及该粘贴兜底。
 
 GNOME 缩放桌面在使用 Portal 原生键鼠时，若支持 `ConnectToEIS` 和屏幕 `mapping_id`，通过同一授权会话的 EIS 接口注入输入，按匹配的区域与实际帧尺寸分别映射横纵坐标，没有固定分辨率或缩放倍率，可避免 `NotifyPointerMotionAbsolute` 在缩放时拒绝坐标。Portal 构建需要 libei ≥ 1.1。缺少 EIS 支持时保留旧输入路径及其既有缩放限制；其他初始化错误会明确报告并触发会话恢复。EIS 连接成功后全部输入统一使用 EIS。只采集画面或使用 uinput 时不会初始化 EIS；缺少可选的逻辑尺寸也不阻断采集。键盘沿用项目现有的 Windows VK → evdev 映射。恢复时保持编码器的采集帧尺寸不变，允许缩放后的逻辑尺寸变化。GNOME 显示配置变化后，已推流的 Portal 采集若持续「暂停且无有效格式」，会在关联通知后的 200 毫秒宽限结束后提前进入现有恢复流程；正常重协商恢复会取消提前判定，连续通知不会推迟同次异常的判定。未收到相关通知时保留五秒兜底；静态画面或有效格式下的暂停不会触发恢复。Ubuntu 26.04、GNOME Wayland 单屏 3840×2160 已实测保持连接切换 200%→166.67%→200%，恢复后画面持续更新且鼠标可控制全屏；切换期间会短暂停顿、黑屏后恢复，五秒是兜底判定阈值，并非总恢复时间。提前恢复的测量结果和验证范围见 [#35](../../pull/35)。此路径仍需实机验证锁屏恢复；多屏、连接中改变分辨率及旋转/镜像变换不属于本次修复范围。 捕获设置协议仍为版本 4：对客户端上报的分辨率统一使用像素坐标、DPR 为 1；Portal 逻辑尺寸仅用于本地输入映射。
 
@@ -82,17 +104,29 @@ GNOME Portal 的控制通道不再等待授权窗口或第一帧画面：先通�
 
 锁屏黑帧使用 FFmpeg 的 libx264/libx265 编码器（按已协商的 H.264/H.265 选择），硬件编码器可用并不代表这些软件编码器已安装。编码失败会明确记录日志。黑帧不改变采集权限或上报的真实屏幕尺寸；解锁或锁状态未知时暂停，采集就绪、拒绝或连接关闭时结束，再由真实视频接续同一条视频轨。对照实验与验证范围见 [#29](../../issues/29)、[#34](../../pull/34)。
 
-原生 Wayland 后端需要合成器提供 `wlr-output-power-management` 才能唤醒已关闭的屏幕；缺少该协议不影响采集和编码。
+原生 Wayland 后端需要合成器提供 `wlr-output-power-management` 才能唤醒已关闭的屏幕；缺少该协议不影响采集和编码。视频启动及运行期间，屏幕保活失败仅记录警告并在下轮重试，不终止视频；实际采集、编码或发送错误仍按原逻辑处理。
 
 原生 Wayland 实验选项：`UU_WAYLAND_PIPELINE=0` 可关闭流水线做对照。`UU_WAYLAND_DMABUF=1` 显式尝试 dma-buf→GBM CPU 映射（默认关闭，需要运行时 libgbm；可用 `UU_WAYLAND_DMABUF_DEVICE` 指定 render node，默认 `/dev/dri/renderD128`）。仅支持显式线性修饰符、单平面 8-bit RGB，失败回退 SHM；virgl VM 中只验证了回退，成功导入/映射和硬件加速均未验证。这不是零拷贝 VAAPI 路径；选择 `UU_VIDEO_ENCODER=vaapi` 时仍由 FFmpeg 上传 CPU 帧。
 首次连接时，桌面会弹窗请求「远程桌面 / 屏幕共享」授权，同意后会记住授权。
+
+### 多显示器切换（实验性）
+
+原生 Wayland 的绝对鼠标定位默认绑定正在采集的输出，修复双屏桌面下的点击偏移。uinput 可继续用于键盘、按键和相对移动。
+
+设置 `UU_WAYLAND_MULTISCREEN=1` 后，手机端可选择并切换物理显示器；`UU_WAYLAND_OUTPUT` 指定默认屏幕。画面与绝对鼠标定位同步切换，支持不同分辨率、缩放和桌面位置。
+
+X11 会话默认把所有显示器拼成一张画面。设置 `UU_X11_MULTISCREEN=1` 后，主机按 `xrandr --listmonitors` 列出各个显示器，控制端可选择其中一块，只采集该区域，绝对鼠标坐标加上该屏幕在桌面中的偏移；默认屏幕为主显示器，`UU_X11_OUTPUT` 可指定其他屏幕（如 `HDMI-1`）。显示器布局在主机启动时读取，改动后需重启服务。此模式下控制端的「分辨率」改为缩放画面，不再修改显示模式。实验性：目前只有单元测试与 Xvfb 虚拟显示器实测，尚未经官方客户端实机验收。
+
+切屏复用同一条视频轨道，过渡期间暂停输入，发送新屏首帧后恢复；采集或编码失败、等待首帧超时会请求恢复原屏。Hyprland 通过 `hyprctl` 枚举未旋转的显示器，显示器插拔或布局变化后需重启服务。已在 Omarchy / Hyprland 上用官方手机客户端实测 2560×1440（125%）与 1920×1080（133.33%）双屏切换及点击。
+
+niri 会话通过 `niri msg --json outputs` 枚举已启用的显示器。普通及 90°/180°/270° 旋转输出仅在 `NIRI_SOCKET` 存在时启用；镜像变换暂不支持。三屏切换、90° 竖屏画面与点击，以及手机向 Codex 输入中文已在 CachyOS + niri 实测。其他合成器继续拒绝旋转输出，保留原有文本输入路径。显示器布局变化后需重启服务。
 
 ## 尚未实现 / 不支持
 
 | 功能 | 状态 |
 |---|---|
-| 多显示器切换 | 开发中 |
-| 真彩（4:4:4） | 支持（v0.1.15）：NVENC / libx264 的默认 FFmpeg 管线输出 H.264 High 4:4:4；VAAPI 和 `inproc-av` 管线仍为 4:2:0，并如实回报给客户端 |
+| 多显示器切换 | niri / Hyprland 原生 Wayland 后端与 X11（`UU_X11_MULTISCREEN=1`）实验性支持，见上文 |
+| 真彩（4:4:4） | 支持（v0.1.15）：NVENC / libx264 的默认 FFmpeg 管线输出 H.264 High 4:4:4；`inproc-av` 原生 NVENC 输出 H.264 High 4:4:4 / HEVC FRExt；VAAPI 管线仍为 4:2:0，并如实回报给客户端 |
 | HDR | 未实现 |
 | 超级屏 / 虚拟显示器 | 未实现 |
 | 被控端防窥模式 | 未实现 |
@@ -104,6 +138,42 @@ GNOME Portal 的控制通道不再等待授权窗口或第一帧画面：先通�
 
 ## 安装
 
+### 0. 直接用 Release 预编译包（推荐，x86_64 / aarch64）
+
+**Ubuntu / Debian（v0.2.18 起）**：下载 `uu-remote-linux_<版本>_amd64.deb`（ARM64 选 `arm64`）后：
+
+```sh
+sudo apt install ./uu-remote-linux_<版本>_amd64.deb
+uuremote-server login                                   # 用 UU 远程 App 扫码
+systemctl --user enable --now uuremote-native.service   # 随图形会话启动
+```
+
+deb 会安装程序、插件、用户级 systemd 服务和应用菜单图标，并通过依赖自动装上 FFmpeg；uinput 权限不会自动开启（见第 5 步）。
+GNOME / KDE 会把显示环境自动传给服务；Xfce 等不传的桌面需按第 4 步补 `DISPLAY`。
+
+**其他发行版**：从 [Releases](../../releases/latest) 下载 `uu-remote-linux-<版本>-x86_64-linux.tar.gz`（ARM64 选 `aarch64-linux`），解压后用普通桌面用户（不要 root）运行：
+
+```sh
+cd uu-remote-linux-<版本>-x86_64-linux
+./install.sh          # 加 --yes 不询问；--no-ffmpeg 只检查不安装
+```
+
+脚本把程序和插件装到 `~/.local`，写入用户级 systemd 服务（已有则保留），并检查 FFmpeg（需带 libx264，否则客户端会一直停在「正在传输画面」）。
+缺 FFmpeg 时经 sudo 用 apt / pacman 安装；Fedora 需先启用 RPM Fusion，openSUSE 需 Packman 源，脚本只提示命令、不替你添加第三方源。
+服务启动时和每次有人连接桌面时都会检查 FFmpeg：不可用就记 error，并弹桌面通知（没有通知服务时打开主窗口，顶部红字提示安装方法，最多每 5 分钟一次）；装好后重新连接即可，不用重启服务。
+
+同一个包支持 X11、Hyprland 等 wlroots 合成器和 GNOME/KDE Wayland：程序启动时按当前会话自动选择后端，只在 Wayland 会话里
+才加载对应的 `libuu-*.so`，X11 用户不需要任何 Wayland 库。系统要求：
+
+| 会话 | 要求 |
+|---|---|
+| X11 | glibc ≥ 2.35（Ubuntu 22.04、Debian 12 及更新） |
+| Hyprland / Sway / niri 等 wlroots | 同上，另需 `libwayland-client`、`libxkbcommon`（Wayland 桌面自带） |
+| GNOME / KDE Wayland | glibc ≥ 2.39（Ubuntu 24.04、Fedora 40、Debian 13 及更新），以及 libei ≥ 1.1、PipeWire |
+
+插件放在 `uuremote-server` 同目录、`../lib/uu-remote-linux/`、`~/.local/lib/uu-remote-linux/` 或 `/usr/lib/uu-remote-linux/` 都能找到
+（`UU_ENGINE_DIR` 可指定）。缺库或版本太旧时日志会写明原因。之后从第 3 步「登录」继续；其他架构请按下面源码编译。
+
 ### 1. 依赖（Ubuntu / Debian）
 
 ```sh
@@ -114,6 +184,8 @@ sudo apt install build-essential pkg-config \
 sudo apt install libwayland-dev libxkbcommon-dev wl-clipboard
 # 可选：GNOME/KDE portal 后端
 sudo apt install libglib2.0-dev libpipewire-0.3-dev libei-dev
+# 可选：inproc-av 的 VAAPI/DRI3 引擎编译所需（libva 本体运行时加载）
+sudo apt install libva-dev libgbm-dev libx11-xcb-dev libxcb-dri3-dev libxcb-damage0-dev
 ```
 
 - 需要 Rust 工具链（<https://rustup.rs>）。
@@ -128,6 +200,9 @@ cargo build --release --features wayland      # + Hyprland
 cargo build --release --features wayland,portal   # + GNOME/KDE Wayland
 ```
 
+控制端的 `viewer-ffmpeg` 只支持 **FFmpeg 6.x**（`pkg-config --modversion libavcodec` 为 60.x）；FFmpeg 7 及以上会在依赖 `ffmpeg-sys-next` 里报 `avfft.h file not found`（#63）。
+服务端可选的 `--features inproc-av` 是 X11 下的进程内硬件编码：不链接 FFmpeg 开发库，NVENC 运行时加载 NVIDIA 驱动库（`libcuda.so.1`、`libnvidia-encode.so.1`，需要支持 NVENC API 12.1 的驱动，530 及以上），VAAPI 运行时加载 `libva.so.2`/`libva-drm.so.2`。截屏与编码尺寸一致时 NVENC 直接读取 XShm 缓冲，省去一次主机到显存的拷贝；VAAPI 在同一特性下也进程内运行（DRI3 DMA-BUF 零拷贝，无 DRI3 时 XShm 上传，VPP 转 NV12 后送 VCN，支持 H.264/H.265）。CPU 编码或 `UU_CAPTURE=grab` 仍走外部 FFmpeg 进程；进程内硬件编码启动失败时先回退到对应的 FFmpeg 进程管线，再回退到 CPU。默认构建和预编译包都不需要该特性。
+
 ### 3. 登录
 
 在图形桌面里运行：
@@ -139,6 +214,10 @@ cargo build --release --features wayland,portal   # + GNOME/KDE Wayland
 用手机上的 **网易 UU 远程 App** 扫码并确认即可。登录信息只保存在本机的
 `~/.config/uuremote/config.json`（权限 0600）里。
 
+登录状态查询失败或达到 60 秒请求超时不代表二维码已过期，也不代表手机已经确认。程序保留官方客户端的刷新策略：查询出错后点击「刷新二维码」（终端按回车；无窗口且无终端时 60 秒后刷新）。二维码请求诊断只包含请求阶段、错误类别、耗时、HTTP/API 状态及最后已知扫码状态，不输出票据、URL 或响应内容；`connect` 类别本身不能确定是 DNS、TLS 还是代理问题。
+
+这个文件里还有本机的设备身份（`device_id`、`client_id`、`system_id`），重装软件和重新扫码登录都会沿用它。**不要在机器之间拷贝 `config.json`，也不要从带着家目录的快照/数据盘克隆出第二台主机**：同一身份的两个主机实例（不论在同一台还是不同机器上）会互相把对方踢出房间，日志表现为每隔几秒出现 `Cloud room leave without peer identifier` 并反复重连，控制端一连就断。克隆或拷贝出来的机器先停掉服务，删掉配置里这三个键和 `token`、`csrf`、`user_id`，再运行 `uuremote-server login` 注册为新设备。同一台机器上残留的旧实例（例如以前手动启动的 `~/.local/bin/uuremote-server`）也会这样，`uuremote-server doctor` 发现多个主机实例时会提示。
+
 ### 4. 作为用户服务常驻
 
 `~/.config/systemd/user/uuremote-native.service`：
@@ -147,17 +226,17 @@ cargo build --release --features wayland,portal   # + GNOME/KDE Wayland
 [Unit]
 Description=UU Remote Linux host (unofficial)
 After=graphical-session.target
+PartOf=graphical-session.target
 
 [Service]
 Environment=RUST_LOG=info
-# X11 桌面需要指明显示器；GNOME 的 XAUTHORITY 一般在 /run/user/<uid>/gdm/Xauthority
-Environment=DISPLAY=:0
+# GNOME/KDE 等桌面会把 DISPLAY / WAYLAND_DISPLAY 导入用户管理器，并启动 graphical-session.target
 ExecStart=%h/.local/bin/uuremote-server
 Restart=always
 RestartSec=5
 
 [Install]
-WantedBy=default.target
+WantedBy=graphical-session.target
 ```
 
 ```sh
@@ -168,6 +247,9 @@ journalctl --user -u uuremote-native.service -f   # 看到 availability=Some("re
 ```
 
 如果还没有登录，服务会自动在桌面上弹出扫码窗口。
+
+Xfce、i3 等不启动 `graphical-session.target` 的桌面，按上面的写法开机不会自启：把 `[Install]` 改成 `WantedBy=default.target`，
+并加上 `Environment=DISPLAY=:0`（按实际显示器填写），再重新 `enable`。下文的无头模式、虚拟桌面也要用 `default.target`。
 
 ### 5. Wayland 下使用 uinput 虚拟键鼠（推荐）
 
@@ -208,7 +290,7 @@ install -Dm644 contrib/desktop/uu-remote-linux-viewer.desktop ~/.local/share/app
 ## 没有显示器的服务器
 
 **无头模式**：只要终端、文件传输和端口映射，不需要图形界面。在服务里加 `Environment=UU_DESKTOP_BACKEND=none`，
-再执行 `loginctl enable-linger $USER`，这样开机后不用登录，systemd 用户服务（以及 `XDG_RUNTIME_DIR`、用户 D-Bus）也会自动启动。
+把 `[Install]` 改成 `WantedBy=default.target`（无人登录时 `graphical-session.target` 不会启动），再执行 `loginctl enable-linger $USER`，这样开机后不用登录，systemd 用户服务（以及 `XDG_RUNTIME_DIR`、用户 D-Bus）也会自动启动。
 无头模式下控制端点「远程桌面」会一直显示正在连接，这是正常的。首次登录用 `uuremote-server login --no-gui` 在终端里扫码。
 
 **群晖 / NAS（Docker）**：没有桌面的 NAS 可以用容器运行无头模式（文件传输、终端、端口映射）。
@@ -248,19 +330,35 @@ systemctl --user restart uuremote-native.service
 |---|---|
 | `UU_CONFIG` | 配置文件路径（默认 `~/.config/uuremote/config.json`） |
 | `UU_DESKTOP_BACKEND` | `auto` / `x11` / `wayland` / `portal` / `kms`（实验性特性） / `none`（无头模式） |
+| `UU_DESKTOP_RESIZE=0` | X11 下控制端切换分辨率时不改桌面分辨率，只缩放编码画面 |
+| `UU_NVENC_RGB=0` / `=1` | NVENC 直接编码 BGRA（省 CPU）。显示器接在 NVIDIA 卡上时默认关闭（同卡合成时直吃反而更慢），`0` 强制关，`1` 强制开 |
+| `UU_WAYLAND_MULTISCREEN=1` | 启用 Hyprland / niri 物理显示器切换（默认关闭） |
+| `UU_WAYLAND_OUTPUT` | 原生 Wayland 默认采集输出名称，例如 `HDMI-A-1` |
+| `UU_X11_MULTISCREEN=1` | X11 下按显示器分别选择和采集（实验性，默认关闭，需要 `xrandr`） |
+| `UU_X11_OUTPUT` | X11 默认采集的显示器名称（`xrandr --listmonitors`），默认主显示器 |
+| `UU_WAYLAND_NO_VIRTUAL_KEYBOARD=1` | 原生 Wayland 不创建虚拟键盘（如 Denial 只把它给自己的输入法），键盘改走 uinput。合成器没有 wlr-virtual-pointer 时鼠标也自动改走 uinput（#72） |
 | `UU_INPUT_BACKEND` | `auto`（默认，Wayland 下可用时用 uinput）/ `uinput` / `native` |
 | `UU_TERMINAL_SHORTCUTS=0` | 关闭终端窗口里的 Ctrl+V 粘贴转换 |
-| `UU_VIDEO_ENCODER` | `cpu` 强制 CPU；`vaapi` 显式启用 Intel/AMD 硬编；`nvenc` 强制 NVENC；未设置时检测到 NVIDIA 驱动才用 NVENC，否则用 CPU |
+| `UU_VIDEO_ENCODER` | `cpu` 强制 CPU；`vaapi` 显式启用 Intel/AMD 硬编；`nvenc` 强制 NVENC；未设置或 `auto` 时后台探测（每个候选编码一帧，限时 3 秒）。有 NVIDIA 驱动时顺序是 NVENC → CPU；没有 NVIDIA 时只有 CPU，不探测。探测未完成就建流则沿用旧规则（有 NVIDIA 用 NVENC，否则 CPU）。自行编译的 `--features inproc-av` 上，仅 X11 会先走进程内引擎：外部 FFmpeg 探测失败时记为 `native_unprobed`，沿用旧规则（NVENC）；Wayland、portal、KMS 回退 CPU。只有 CPU 时跳过探测，记为 `not probed (only candidate)`。探测成功和这种只含 CPU 的跳过会缓存到 NVIDIA 是否存在发生变化为止（`/proc/driver/nvidia/version` 或 `/dev/nvidia0`）。之后的桌面连接在后台再探测一次（不挡住这一路，仍用缓存的编码器）。NVENC 探测失败、选用 CPU 时只缓存 10 分钟；到期后下一次桌面连接同样在后台再探测一次，再次失败则重新计 10 分钟。显式 `cpu` / `vaapi` / `nvenc` 不启动探测。`native_unprobed` 不算失败缓存。优先级低于 `host_settings.json` 里非 `auto` 的 `video_encoder`。VAAPI 要等 #33 解决后才会进入 auto |
 | `UU_VAAPI_BUFFER_MS` | VAAPI 的 VBV 缓冲（10–1000 ms，仅 `UU_VIDEO_ENCODER=vaapi` 时生效）；高分辨率下关键帧被压糊时用它换稳定画质 |
+| `UU_NVENC_BUFFER_MS` | NVENC 的 VBV 缓冲（10–1000 ms，仅 NVENC 生效，含进程内引擎）；默认 100–500 kbit，1440p 等高分辨率下关键帧被压糊、按 GOP 周期闪烁时设 `1000`（#103） |
 | `UU_FFMPEG_ROOT` | 使用指定目录下的 FFmpeg |
 | `UU_AUDIO=0` | 关闭声音转发；`UU_AUDIO_SOURCE` 指定 PulseAudio 采集源 |
 | `UU_LOGIN_WINDOW=0` | 凭证缺失时不自动弹出登录窗口 |
 | `UU_REMOTE_ASSIST=0` | 关闭远程协助（未登录时也不再以访客身份提供协助） |
 | `UU_ASSIST_ALLOW=1` | 启动时就允许他人远程协助（覆盖窗口里保存的开关状态） |
 | `UU_PORT_MAPPING=0` | 关闭端口映射（对应官方被控端的开关） |
-| `UU_USE_PROXY=1` | 使用环境变量里的 HTTP/SOCKS 代理；默认忽略代理、直连网易服务器 |
+| `UU_WOL_HELPER=1` | 实验性：让这台主机像官方 Windows 被控端一样充当「远程开机」辅助设备——登录后向网易上报本机局域网信息，收到云端唤醒请求时向同一局域网发送唤醒包（未经端到端验证） |
+| `UU_USE_PROXY=1` | REST API 与 host/viewer WebSocket 信令共用环境 HTTP/HTTPS 代理策略；默认忽略代理、直连 |
 
-「远程结束后自动锁屏」「静音运行」等设置保存在 `~/.config/uuremote/host_settings.json`。
+
+`UU_USE_PROXY=1` 仅使用当前进程已有的代理配置；`HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY`（及小写形式）和 `NO_PROXY` 按 reqwest 的标准规则选择，大写优先。信令拒绝选定变量中的无效/不支持的代理 URL（仅 HTTP/HTTPS；不支持 SOCKS）、带路径/查询/片段的代理 URL，以及会忽略代理的 CGI 环境；此校验比 reqwest 默默忽略坏值更严格。未配置匹配代理或命中 `NO_PROXY` 时仍正常直连，选中代理后连接失败不会改为直连。信令保留 TLS 证书校验，不跟随重定向，也不转发认证头到重定向目标。
+
+开启后主机还会经 TCP/TLS 连接云端 TURN 中继（使用 `HTTPS_PROXY`/`ALL_PROXY` 里的无认证 `http://` 代理做 CONNECT，没有代理则直连），适用于 UDP 到不了 TURN 服务器、只有 TCP/代理能出网的主机；TURN 证书按 CA 链校验，云端下发的 TURN 地址是 IP 时容忍名称不匹配（媒体本身由 DTLS-SRTP 端到端加密）。默认（不开代理）只用 UDP 中继，行为不变。**这不创建任何新的网络出口**：登录、信令和媒体仍需各自有允许使用的网络路径。连接器只返回固定错误类别/HTTP 状态；不要为诊断开启会记录 URL/认证信息的依赖库 TRACE 日志。
+
+「远程结束后自动锁屏」「静音运行」等设置保存在 `~/.config/uuremote/host_settings.json`。同一文件里的 `video_encoder`（`auto`/`cpu`/`vaapi`/`nvenc`）和 `video_codec`（`auto`/`h264`/`h265`）用 `uuremote-server set-encoder`、`uuremote-server set-codec` 写入（非法参数退出码 2）。非 `auto` 的值优先于 `UU_VIDEO_ENCODER` / `UU_VIDEO_CODEC`；`auto` 或留空则落到环境变量，再落到 auto（有 NVIDIA 时 NVENC 优先，失败再 CPU；没有 NVIDIA 时就是 CPU，不探测；codec 仍是硬件优先 H.265、CPU 用 H.264）。探测在启动时后台进行，不挡住第一路出图。成功结果缓存到进程退出，但 NVIDIA 是否存在（`/proc/driver/nvidia/version` 或 `/dev/nvidia0`）与报告不一致时，下一次桌面连接会在后台再探测一次（`warm_auto_probe`），这一路仍用缓存的编码器，直到新结果写入。NVENC 失败只缓存 10 分钟，到期后的桌面连接同样在后台再探测一次，这一路仍用当前结果。`set-encoder` 和 `set-codec` 写完后若 `host.pid` 指向正在运行的本程序，都会发 `SIGUSR2`：编码器变化时进行中的桌面流立刻换编码器（不断开，沿用本会话已协商的 codec；新编码器起不来时按进程内 → FFmpeg 进程 → CPU 回退）。手改文件后可 `kill -USR2 $(cat ~/.config/uuremote/host.pid)`。`SIGUSR2` 不重新探测。codec 偏好仍在下次建立桌面连接时生效（运行中的 host 只记日志，不重开编码）。显式 `vaapi` 请求真彩时仍用 VAAPI、编码 4:2:0，并在 CaptureSettingSync 的 field 3 回报 4:2:0。所选编码器在本机不可用时，建流回退 CPU 并记 warning。VAAPI 进入 auto 要等 #33。
+
+自定义码率按客户端选择的 Mbps 生效，例如 1 Mbps 对应 1000 kbit/s 的编码上限。
 
 选择码率档（原画 / 超清 / 高清 / 自定义）时，外部 FFmpeg 的 CPU 编码以平均码率（ABR）为目标，避免 4K 低码率下关键帧发灰；「自动」档仍使用恒定质量（CRF）。
 
@@ -312,8 +410,9 @@ flowchart LR
 
 ### H.265 / HEVC
 
-控制端和主机都支持 H.265 时，主机自动使用 H.265（与官方主机一致，由主机按双方能力选择；官方 Mac 客户端在 SDP
-中优先列出 H.265）。首次桌面连接会用合成帧探测实际编码能力，并通过 CodecNegotiation 告知客户端。支持 `hevc_nvenc`、
+控制端和主机都支持 H.265、且主机使用硬件编码器（NVENC / 显式 VAAPI）时，主机自动使用 H.265（与官方主机一致，由主机按双方能力选择；官方 Mac 客户端在 SDP
+中优先列出 H.265）。**只有 CPU 编码时默认用 H.264**：libx265 比 libx264 慢约 10 倍（4 核 ARM 上 1080p 实测约 15 帧对 155 帧，#59），
+可用 `UU_VIDEO_CODEC=h265` 强制 H.265。实际帧率由控制端的「画质/帧率」菜单决定；`UU_DISPLAY_FPS` 只改上报的显示器刷新率。首次桌面连接会用合成帧探测实际编码能力，并通过 CodecNegotiation 告知客户端。支持 `hevc_nvenc`、
 `libx265`、显式 `UU_VIDEO_ENCODER=vaapi` 的 `hevc_vaapi`；硬件失败先回落软件 HEVC，再回落 H.264。
 `UU_VIDEO_CODEC=h264` 强制使用 H.264。8-bit；真彩 4:4:4 使用 hevc_nvenc `rext` / libx265 `main444-8`。
 已用官方 Mac 客户端在 RTX 3090（hevc_nvenc，含 4:4:4）实机验收；`hevc_vaapi` 配官方 Android 客户端也已实机验收
@@ -323,13 +422,14 @@ HEVC 的访问单元按 RFC 7798 的图片边界切分，不依赖 AUD：`hevc_v
 画面从码流里丢掉，读取端按 AUD 切分就会把整个 GOP 当成一帧，再被 IRAP 门控全部拒绝——对外表现为连接停在
 「正在传输画面」，而主机侧只有约 12 kbit/s。`UU_VIDEO_CODEC=h265` 可显式选中 H.265，便于对照排查。
 
-### VAAPI 硬件编码（显式启用）
+### VAAPI 硬件编码
 
-设置 `UU_VIDEO_ENCODER=vaapi` 使用 Intel/AMD H.264 VAAPI；`UU_VAAPI_DEVICE` 默认
-`/dev/dri/renderD128`，运行用户需要 render 节点权限。不会自动选择 VAAPI；设备或驱动初始化
-失败会明确警告并回退 libx264。外部 FFmpeg 和 `--features inproc-av` 均先转 NV12 再上传硬件帧。
+`UU_VIDEO_ENCODER=vaapi` 或 `set-encoder vaapi` 显式选择 Intel/AMD H.264 VAAPI。
+`UU_VAAPI_DEVICE` 默认 `/dev/dri/renderD128`，运行用户需要 render 节点权限。
+`auto` 有 NVIDIA 驱动时是 NVENC → CPU，没有 NVIDIA 时是 CPU。VAAPI 只通过显式选择启用，进入 auto 要等 #33。
+设备或驱动初始化失败会明确警告并回退 libx264。外部 FFmpeg 先转 NV12 再上传硬件帧。
 VBR 使用控制端码率预设及 CQ 对应的最小 QP，无 B 帧、async depth=1，并保留现有 GOP/VFR 规则。
-Intel 核显（UHD 770，iHD 驱动）已实机验收：默认的外部 FFmpeg 管线用官方 Mac 控制端测试了各档画质、帧率、缩放和重连，全程硬件编码、无回退，CPU 占用比 libx264 低约 40%。**AMD 显卡和 `--features inproc-av` 管线的 VAAPI 尚未实机验证。**
+Intel 核显（UHD 770，iHD 驱动）已实机验收：默认的外部 FFmpeg 管线用官方 Mac 控制端测试了各档画质、帧率、缩放和重连，全程硬件编码、无回退，CPU 占用比 libx264 低约 40%（该数字为 FFmpeg 进程管线时代的测量）。AMD 核显已在**进程内原生引擎**上实机验收（`--features inproc-av`）：官方 Mac 客户端的端到端会话在 HawkPoint（Mesa 26.2.3）与 Cezanne（Mesa 26.2.5）上通过验收（HEVC，含画质档、帧率、缩放）；Cezanne 上另以探测验证了 H.264 与两条采集路径——XShm 上传（码流可解码、画面正确）与 DRI3 DMA-BUF 零拷贝导入。同机实测（1920×1200@60，Cezanne iGPU + RTX 3050 Ti 双显卡）：进程内 VAAPI 每帧编码 CPU 约为 libx264（FFmpeg 管线 superfast）的 **1/12**、进程内 NVENC 的 **1/5**；外部 FFmpeg 进程管线（预编译包使用）在 AMD 上未单独验证。
 
 高分辨率下 VAAPI 的默认 VBV 缓冲（100–500 kbit）会把关键帧压得过狠：2560×1440 H.264 VAAPI、30M
 上限、静止画面上实测首个 IDR 只有 59,910 字节，画面每隔一个 GOP 糊一下再慢慢恢复。设
@@ -365,7 +465,8 @@ cargo build --release --features wayland
 
 Omarchy 使用 Hyprland：在其用户会话中运行，设置 `UU_DESKTOP_BACKEND=wayland`，保留
 `WAYLAND_DISPLAY` 和 `XDG_RUNTIME_DIR`。其他合成器可能需要 `--features wayland,portal`。
-uinput 需加载内核模块（开机自动加载：`echo uinput | sudo tee /etc/modules-load.d/uinput.conf`）并应用上文 uaccess 规则；无人登录账号需要专用组的受限授权。
+uinput 需加载内核模块（开机自动加载：`echo uinput | sudo tee /etc/modules-load.d/uinput.conf`）并应用上文 uaccess 规则；无人登录账号需要专用组的受限授权，
+例如 `/etc/tmpfiles.d/uinput.conf` 写入 `z /dev/uinput 0660 root uinput`，再 `sudo usermod -aG uinput <用户>`（只加专用账号）。
 该权限能向整个 seat（包括锁屏/登录界面）注入输入。设置 `UU_INPUT_BACKEND=uinput` 后，
 仍须确认启动日志实际选择了 uinput。
 
@@ -386,11 +487,14 @@ Environment=UU_DESKTOP_BACKEND=wayland
 WantedBy=graphical-session.target
 ```
 
+单元名请保持 `uuremote-native.service`，不要写成模板单元 `uuremote-native@.service`：桌面图标和 `uuremote-server show`
+固定启动这个名字（`UU_SERVICE_UNIT` 可覆盖），systemd 不会把它解析到模板实例。niri 的 `niri --session` 同样会在就绪前导入
+`WAYLAND_DISPLAY`，上面的写法也适用（#55）。
+
 VAAPI 可选包：Intel 新显卡用 `intel-media-driver`，AMD 用 `libva-mesa-driver`，`libva-utils` 提供
 `vainfo`。KMS 依赖 `libdrm`。虚拟 Xfce 依赖 `xorg-server-xvfb xorg-xauth xorg-xdpyinfo
 xfce4-session xfce4-panel xfdesktop xfwm4 gnome-terminal`。
-滚动 Arch 的 FFmpeg 可能超出 `inproc-av` 支持的 6.x；请使用默认进程方案或独立的 FFmpeg 6 前缀，
-不要降级系统 FFmpeg。
+若编译包含 `viewer-ffmpeg`，滚动 Arch 的 FFmpeg 可能超出其支持的 6.x；请使用独立的 FFmpeg 6 前缀，不要降级系统 FFmpeg（服务端的 `--features inproc-av` 原生 NVENC 不依赖 FFmpeg）。
 
 ### 实验性 KMS 截屏
 
@@ -422,11 +526,25 @@ GNOME 与官方 Mac 被控端的双向剪贴板尚未验证通过；此修改不
 - 命令行：`connect DEVICE false - echo legacy [--view-only]`（桌面）、`files DEVICE ls|get|put …`、`terminal DEVICE [SESSION]`、
   `terminal-ui DEVICE NAME`、`portmap DEVICE LOCAL_PORT HOST PORT`（只监听 127.0.0.1）、`power DEVICE reboot|shutdown`、`unbind DEVICE`（从账号删除设备，启动窗口「更多工具」里也有）、
   `assist CONNECT_ID`（验证码从 stdin 读取一行，不能作为参数传入）。`uuremote-viewer --help` 查看全部参数。
+- **安全输入 `type`**（向已打开的桌面会话注入键盘，适合锁屏 PIN / 密码；文本永不进 argv）：
+  ```sh
+  # 推荐：先 ui/connect 打开桌面，再 type（复用会话，不顶掉当前画面）
+  UU_INPUT_ENV=UU_SECRET UU_SECRET='……' \
+    uuremote-viewer type DEVICE [--delay-ms 40] [--omit-last 1] [--snapshot /path/out.png]
+  # 或：printf '%s' '……' | uuremote-viewer type DEVICE
+  # 只检查、不连网：uuremote-viewer type DEVICE --dry-run
+  # 没有正在运行的桌面会话时必须显式：--new-session（会新开连接，并顶掉已打开的桌面窗口，见上游 #30）
+  ```
+  特殊键用花括号：`{Enter}` `{Tab}` `{Esc}` `{Backspace}` `{Ctrl+Alt+Del}` 等；`{{` 表示字面 `{`。
+  **布局**：字符按 **US QWERTY** 物理键位映射（非美式布局的符号/字母可能对不上）。
+  **Windows 数字 PIN**：输满位数后系统常会自动提交，一般不必再发 `{Enter}`；若只想填入、不登录，用 `--omit-last N` 省略最后 N 个字符。
+  日志与 `--dry-run` 输出只含长度/事件数，不含明文。复用会话时，发送约 1 秒后会保存一帧 PNG（默认写在 `$XDG_RUNTIME_DIR/uu-viewer-type/`，权限 0600），路径打在日志并打印 `snapshot=…`。
 - 桌面窗口中按 Ctrl+Alt+F 打开文件窗口（复用同一连接）。`UU_VIEWER_AUDIO=0` 关闭声音，`UU_VIEWER_CLIPBOARD=0` 关闭剪贴板，
   `UU_VIEWER_VIEW_ONLY=1` 只看不控，`UU_VIEWER_FFMPEG` 指定 ffmpeg 路径。
 - 桌面同时提供 H.264 / H.265，由主机协商选择；`UU_VIEWER_CODEC=h264` 将 SDP 和解码能力限制为 H.264。
   默认请求 4:2:0；`UU_VIEWER_CHROMA=444` 在 CONTROL 打开后请求真彩（4:4:4）。主机可能回落到 4:2:0，
   以 CaptureSettingSync 回报为准。两种色度均由 FFmpeg 转为 RGB24 显示。
+- 按被控端原始分辨率解码，窗口缩放使用线性过滤；被控端分辨率变化时自动重启解码器。`UU_VIEWER_SIZE=WxH` 可改为固定的留黑边画布。
 
 Mac 目标使用 macOS 原生键码，Windows / Linux 目标保留 Windows VK。键盘按物理键位置转发，不自动把 Ctrl 改成 Command；
 控制 Mac 时，PC 键盘的 Super / Win 键对应 Command。仅接受已验证的目标平台值 1（Windows / 本项目 Linux 主机）和 4（Mac），

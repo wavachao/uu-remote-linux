@@ -63,6 +63,9 @@ jobs:
             libglib2.0-dev libpipewire-0.3-dev libei-dev
       - uses: dtolnay/rust-toolchain@stable
         if: steps.release.outputs.exists == 'false'
+      - name: Test Wayland/portal before publishing
+        if: steps.release.outputs.exists == 'false'
+        run: cargo test --locked --features wayland,portal
       - name: Build
         if: steps.release.outputs.exists == 'false'
         run: cargo build --release --locked --features wayland,portal

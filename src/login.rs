@@ -8,7 +8,7 @@
 //! (analysis/tools-fix-20261013/viewer-fieldmd.json). Results are written to the private
 //! config file (chmod 600). Tokens and tickets are never printed or logged.
 
-use crate::auth::{Credentials, UUAuthClient};
+use crate::auth::{Credentials, QrRequestErrorKind, UUAuthClient};
 use crate::login_ui::{LoginUi, Tone};
 use serde_json::{json, Value};
 use std::time::Duration;
@@ -127,6 +127,35 @@ fn render_qr(content: &str) -> Result<String, String> {
 /// API code for an expired login QR code.
 const QR_EXPIRED: i64 = 1190;
 
+/// QR API errors must not echo server messages/validation fields: they may contain credentials.
+fn qr_data<'a>(stage: &str, status: u16, body: &'a Value) -> Result<&'a Value, String> {
+    let code = body.get("code").and_then(Value::as_i64);
+    if status == 200 && code == Some(0) { return Ok(body.get("data").unwrap_or(&Value::Null)); }
+    Err(format!("{stage}: http_status={status} api_code={code:?}"))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum QrPollAction { Wait(i64), Scanned, Confirmed, Refresh(Duration), Failed(&'static str) }
+
+/// Preserve the official refresh policy; a failed query says nothing about QR expiry.
+fn qr_poll_action(last_status: i64, http_status: u16, body: &Value) -> QrPollAction {
+    if body.get("code").and_then(Value::as_i64) == Some(QR_EXPIRED) {
+        return QrPollAction::Failed(crate::i18n::s("二维码已失效","QR code expired"));
+    }
+    let Ok(data) = qr_data("qrcode status", http_status, body) else {
+        return QrPollAction::Failed(crate::i18n::s("二维码状态查询失败","QR status check failed"));
+    };
+    match data.get("status").and_then(Value::as_i64) {
+        Some(1) => QrPollAction::Wait(1),
+        Some(2) if last_status != 2 => QrPollAction::Scanned,
+        Some(2) => QrPollAction::Wait(2),
+        Some(0) => QrPollAction::Refresh(Duration::from_millis(350)),
+        Some(3) => QrPollAction::Refresh(Duration::ZERO),
+        Some(4) => QrPollAction::Confirmed,
+        _ => QrPollAction::Failed(crate::i18n::s("二维码状态响应异常","Unexpected QR status response")),
+    }
+}
+
 /// QR modules as RGBA pixels: `scale` pixels per module, `quiet` light modules around the code.
 fn qr_rgba(content: &str, scale: usize, quiet: usize) -> Result<(Vec<u8>, usize), String> {
     let code = qrcode::QrCode::new(content.as_bytes()).map_err(|e| format!("QR encode failed: {e}"))?;
@@ -218,10 +247,10 @@ pub async fn run(gui: bool) -> Result<(), String> {
     };
     match &result {
         Ok(name) => {
-            ui.done(&format!("登录成功\n{name}"));
-            ui.status("登录信息已保存到本机配置，可以关闭此窗口", Tone::Ok);
+            ui.done(&crate::tr!("登录成功\n{name}","Signed in\n{name}"));
+            ui.status(crate::i18n::s("登录信息已保存到本机配置，可以关闭此窗口","Sign-in saved to the local config; you can close this window"), Tone::Ok);
         }
-        Err(e) => { eprintln!("login failed: {e}"); ui.status(&format!("登录失败：{e}"), Tone::Error); }
+        Err(e) => { eprintln!("login failed: {e}"); ui.status(&crate::tr!("登录失败：{e}","Sign-in failed: {e}"), Tone::Error); }
     }
     if ui.shown() { ui.wait_closed().await; }
     result.map(|_| ())
@@ -243,7 +272,26 @@ pub fn prepare_identity() -> Result<(Value, Credentials), String> {
     Ok((cfg, creds))
 }
 
+/// Holds an exclusive lock beside config.json while a device identity is created: the host's own QR
+/// window and the viewer's sign-in can run at once, and two `device/windows/init` calls would leave the
+/// account bound to one device while config.json keeps the other (the host then shows as offline).
+struct IdentityLock(std::fs::File);
+impl IdentityLock {
+    fn acquire() -> Result<Self, String> {
+        use std::os::unix::io::AsRawFd;
+        let path = crate::config::path().with_extension("lock");
+        if let Some(dir) = path.parent() { let _ = std::fs::create_dir_all(dir); }
+        let file = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(&path).map_err(|_| "Cannot open the identity lock")?;
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 { return Err("Cannot lock the device identity".into()) }
+        Ok(Self(file))
+    }
+}
+impl Drop for IdentityLock { fn drop(&mut self) { use std::os::unix::io::AsRawFd; unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN); } } }
+
 pub async fn prepare_device() -> Result<(Value, Credentials), String> {
+    // Read the configuration only after taking the lock, so a waiting process sees the device the
+    // first one registered instead of creating its own.
+    let _lock = tokio::task::spawn_blocking(IdentityLock::acquire).await.map_err(|_| "Identity lock task failed")??;
     let (mut cfg, mut creds) = prepare_identity()?;
     let get = |cfg: &Value, k: &str| std::env::var(format!("UU_{}", k.to_uppercase())).ok().filter(|v| !v.is_empty())
         .or_else(|| cfg.get(k).and_then(|v| v.as_str()).map(str::to_owned)).unwrap_or_default();
@@ -268,18 +316,35 @@ pub async fn prepare_device() -> Result<(Value, Credentials), String> {
 pub(crate) async fn flow(ui: &LoginUi) -> Result<String, String> {
     let (mut cfg, creds) = prepare_device().await?;
     let client = UUAuthClient::new(creds.clone());
-
+    // Mirrors the official Mac client (LoginViewController / LoginManager, UURemote 4.42): gen/login has
+    // no body; the status long poll sends gen's `status_query_ticket` under `token` with the last
+    // status, re-asks as soon as an answer arrives (60 s request timeout), regenerates on status 3
+    // at once and on status 0 after 0.35 s, logs in on 4, and on any error (e.g. HTTP 400 code 1190)
+    // stops until the user asks for a new QR. Sending gen's older `token` field made the cloud reject
+    // every QR within seconds (#68).
+    let timeout = Duration::from_secs(60);
     loop {
-        let (status, resp) = client.post_json("/api/v1/qrcode/gen/login", &json!({})).await?;
-        let d = data("qrcode gen", status, &resp)?;
+        let (status, resp) = match client.post_with_timeout("/api/v1/qrcode/gen/login", None, timeout).await {
+            Ok(r) => r,
+            Err(e) if e.response_received() => {
+                eprintln!("QR generation response failed: {e}");
+                wait_for_refresh(ui, crate::i18n::s("二维码加载失败","QR code failed to load")).await;
+                continue;
+            }
+            Err(e) => return Err(format!("QR generation failed: {e}")),
+        };
+        let d = match qr_data("qrcode gen", status, &resp) {
+            Ok(d) => d.clone(),
+            Err(e) => { println!("QR code could not be loaded ({e})"); wait_for_refresh(ui, crate::i18n::s("二维码加载失败","QR code failed to load")).await; continue; }
+        };
         let url = d.get("qrcode_jump_url").and_then(|v| v.as_str()).ok_or("qrcode gen returned no qrcode_jump_url")?.to_string();
-        let ticket = d.get("token").or_else(|| d.get("status_query_ticket")).and_then(|v| v.as_str())
-            .ok_or("qrcode gen returned no token")?.to_string();
+        let ticket = qr_ticket(&d).ok_or("qrcode gen returned no status ticket")?.to_string();
+        ui.offer_refresh(false);
         if ui.shown() {
             let modules = qrcode::QrCode::new(url.as_bytes()).map_err(|e| e.to_string())?.width() + 2;
             let (rgba, edge) = qr_rgba(&url, (224 / modules).max(2), 1)?;
             ui.qr(&rgba, edge);
-            ui.status("等待扫码…", Tone::Info);
+            ui.status(crate::i18n::s("等待扫码…","Waiting for scan…"), Tone::Info);
         }
         if let Some(path)=std::env::var_os("UU_LOGIN_QR_PNG") {
             use std::io::Write;
@@ -289,40 +354,49 @@ pub(crate) async fn flow(ui: &LoginUi) -> Result<String, String> {
             file.write_all(&crate::cursor::encode_png(edge as u32,edge as u32,&rgba)).map_err(|e|e.to_string())?;
         }
         if !ui.quiet() { println!("\nScan with the UU Remote mobile app (网易UU远程 App 扫码登录):\n{}", render_qr(&url)?); }
-        // Status is a long poll: send the state already shown (server enum 1..4; observed:
-        // 1 waiting, 2 scanned, 4 after the phone confirmed); the server answers when it changes.
         let mut login_status = 1i64;
-        let mut expired = false;
-        for _ in 0..150 {
+        let failure = loop {
             let query = json!({"token": ticket, "qrcode_jump_url": url, "login_status": login_status});
-            let (status, resp) = match client.post_json("/api/v1/qrcode/login/status", &query).await {
+            let (status, resp) = match client.post_with_timeout("/api/v1/qrcode/login/status", Some(&query), timeout).await {
                 Ok(r) => r,
-                Err(_) => continue, // long-poll timeout: ask again
-            };
-            // Code 1190 (HTTP 400, "二维码已失效"): the QR expired; generate a new one.
-            if resp.get("code").and_then(|c| c.as_i64()) == Some(QR_EXPIRED) {
-                ui.status("二维码已过期，正在刷新…", Tone::Info);
-                expired = true; break;
-            }
-            let st = data("qrcode status", status, &resp)?.get("status").and_then(|v| v.as_i64()).unwrap_or(login_status);
-            if st == login_status { continue; }
-            login_status = st;
-            match st {
-                2 => {
-                    println!("已扫码，请在手机上确认 (scanned, confirm on the phone)");
-                    ui.status("已扫码，请在手机上确认登录", Tone::Ok);
+                Err(e) => {
+                    eprintln!("QR status query failed: {e}; last_status={login_status}");
+                    break match e.kind {
+                        QrRequestErrorKind::Timeout => crate::i18n::s("二维码状态查询超时（不代表二维码已失效）","QR status check timed out (the QR code may still be valid)"),
+                        _ => crate::i18n::s("二维码状态查询失败（不代表二维码已失效）","QR status check failed (the QR code may still be valid)"),
+                    };
                 }
-                3 | 4 => {
-                    // A final state: confirmed logs in; cancelled/expired is refused and a new QR follows.
+            };
+            match qr_poll_action(login_status, status, &resp) {
+                QrPollAction::Wait(st) => {
+                    if st == 1 && login_status != 1 { ui.status(crate::i18n::s("等待扫码…","Waiting for scan…"), Tone::Info); }
+                    login_status = st;
+                }
+                QrPollAction::Scanned => {
+                    login_status = 2;
+                    println!("已扫码，请在手机上确认 (scanned, confirm on the phone)");
+                    ui.status(crate::i18n::s("已扫码，请在手机上确认登录","Scanned, confirm the sign-in on your phone"), Tone::Ok);
+                }
+                QrPollAction::Refresh(delay) => {
+                    if delay.is_zero() { println!("QR code expired; generating a new one"); }
+                    else { tokio::time::sleep(delay).await; }
+                    break "";
+                }
+                QrPollAction::Confirmed => {
+                    println!("已确认，正在完成登录 (confirmed, completing login)");
+                    ui.status(crate::i18n::s("已确认，正在完成登录…","Confirmed, finishing sign-in…"), Tone::Info);
                     let body = json!({"token": ticket, "qrcode_jump_url": url});
-                    let (status, resp) = client.post_json("/api/v1/login/by_qrcode", &body).await?;
-                    let d = match data("qrcode login", status, &resp) {
-                        Ok(d) => d,
-                        Err(e) => {
-                            println!("QR status {st}: login not granted ({e})");
-                            ui.status("手机端未确认登录，正在刷新二维码…", Tone::Error);
-                            expired = true; break;
+                    let (status, resp) = match client.post_with_timeout("/api/v1/login/by_qrcode", Some(&body), timeout).await {
+                        Ok(r) => r,
+                        Err(e) if e.response_received() => {
+                            eprintln!("QR login exchange response failed: {e}");
+                            break crate::i18n::s("登录失败","Sign-in failed");
                         }
+                        Err(e) => return Err(format!("QR login exchange failed: {e}")),
+                    };
+                    let d = match qr_data("qrcode login", status, &resp) {
+                        Ok(d) => d,
+                        Err(e) => { println!("QR login not granted ({e})"); break crate::i18n::s("登录失败","Sign-in failed"); }
                     };
                     let token = d.get("token").and_then(|v| v.as_str()).ok_or("login returned no token")?;
                     let user = d.get("user_id").and_then(|v| v.as_str()).ok_or("login returned no user_id")?;
@@ -339,19 +413,88 @@ pub(crate) async fn flow(ui: &LoginUi) -> Result<String, String> {
                     println!("Logged in as {} ({}); saved to {}", nickname, user, path.display());
                     return Ok(if nickname.is_empty() { user.to_string() } else { nickname.to_string() });
                 }
-                _ => { println!("QR status: {st}"); ui.status("二维码已失效，正在刷新…", Tone::Error); expired = true; break; }
+                QrPollAction::Failed(reason) => {
+                    eprintln!("QR status query stopped: http_status={status} api_code={:?} status={:?} last_status={login_status}",
+                        resp.get("code").and_then(Value::as_i64), resp.get("data").and_then(|d| d.get("status")).and_then(Value::as_i64));
+                    break reason;
+                }
             }
-        }
-        println!("{}", if expired { "QR code expired; generating a new one" } else { "QR code timed out; generating a new one" });
-        tokio::time::sleep(Duration::from_secs(1)).await; // never spin if the server keeps refusing
+        };
+        if !failure.is_empty() { wait_for_refresh(ui, failure).await; }
     }
+}
+
+/// gen/login's status ticket: `status_query_ticket` (current cloud and official clients), else the
+/// older `token` field for servers that do not send it.
+fn qr_ticket(gen: &Value) -> Option<&str> {
+    gen.get("status_query_ticket").or_else(|| gen.get("token")).and_then(|v| v.as_str()).filter(|t| !t.is_empty())
+}
+
+/// Stop like the official client and wait for the user: the 刷新二维码 button, Enter in a terminal,
+/// or (no window and no terminal, e.g. a service) one minute.
+async fn wait_for_refresh(ui: &LoginUi, reason: &str) {
+    use std::io::IsTerminal;
+    ui.status(&crate::tr!("{reason}，请点击「刷新二维码」","{reason}. Click \"Refresh QR code\"."), Tone::Error);
+    ui.offer_refresh(true);
+    let terminal = !ui.quiet() && std::io::stdin().is_terminal();
+    if terminal { println!("{reason}. Press Enter to show a new QR code (按回车刷新二维码)"); }
+    else { println!("{reason}; waiting for 刷新二维码{}", if ui.shown() { "" } else { " (a new QR code follows in 60 s)" }); }
+    let mut line = terminal.then(|| tokio::task::spawn_blocking(|| { let mut s = String::new(); let _ = std::io::stdin().read_line(&mut s); }));
+    let started = std::time::Instant::now();
+    loop {
+        if ui.take_refresh() || (ui.shown() && ui.closed()) { break; }
+        if let Some(handle) = line.as_mut() { if handle.is_finished() { break; } }
+        if !ui.shown() && !terminal && started.elapsed() >= Duration::from_secs(60) { break; }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    ui.offer_refresh(false);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[tokio::test]
-    async fn service_waits_until_a_new_token_is_saved() {
+    #[test]
+    fn qr_poll_keeps_waiting_scanned_and_confirmed_distinct() {
+        let reply = |status| json!({"code": 0, "data": {"status": status}});
+        assert_eq!(qr_poll_action(1, 200, &reply(1)), QrPollAction::Wait(1));
+        assert_eq!(qr_poll_action(1, 200, &reply(2)), QrPollAction::Scanned);
+        assert_eq!(qr_poll_action(2, 200, &reply(2)), QrPollAction::Wait(2));
+        assert_eq!(qr_poll_action(2, 200, &reply(4)), QrPollAction::Confirmed);
+        assert_eq!(qr_poll_action(1, 200, &reply(0)), QrPollAction::Refresh(Duration::from_millis(350)));
+        assert_eq!(qr_poll_action(2, 200, &reply(3)), QrPollAction::Refresh(Duration::ZERO));
+        assert_eq!(qr_poll_action(2, 400, &json!({"code": 1190})), QrPollAction::Failed(crate::i18n::s("二维码已失效","QR code expired")));
+    }
+
+    #[test]
+    fn qr_poll_failures_do_not_imply_expiry_or_confirmation() {
+        for last in [1, 2] {
+            for body in [json!(null), json!({"code": 1}), json!({"code": 0, "data": {"status": 4}})] {
+                assert_eq!(qr_poll_action(last, 503, &body), QrPollAction::Failed(crate::i18n::s("二维码状态查询失败","QR status check failed")));
+            }
+            assert_eq!(qr_poll_action(last, 200, &json!({"code": 1})), QrPollAction::Failed(crate::i18n::s("二维码状态查询失败","QR status check failed")));
+            for data in [json!(null), json!({}), json!({"status": "4"}), json!({"status": 99}), json!({"status": -1})] {
+                assert_eq!(qr_poll_action(last, 200, &json!({"code": 0, "data": data})), QrPollAction::Failed(crate::i18n::s("二维码状态响应异常","Unexpected QR status response")));
+            }
+        }
+    }
+
+    #[test]
+    fn qr_api_errors_do_not_echo_server_content() {
+        let body = json!({"code": 1001, "msg": "fixture-token", "data": [{"loc": "fixture-ticket"}]});
+        assert_eq!(qr_data("qrcode gen", 400, &body).unwrap_err(), "qrcode gen: http_status=400 api_code=Some(1001)");
+    }
+
+    #[test]
+    fn status_ticket_prefers_status_query_ticket() {
+        assert_eq!(qr_ticket(&json!({"token": "old", "status_query_ticket": "new"})), Some("new"));
+        assert_eq!(qr_ticket(&json!({"token": "old"})), Some("old"));
+        assert_eq!(qr_ticket(&json!({"status_query_ticket": ""})), None);
+    }
+    #[test]
+    fn service_waits_until_a_new_token_is_saved() {
+        let _env = crate::config::test_env_lock().lock().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
         let dir = std::env::temp_dir().join(format!("uu-login-wait-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config.json");
@@ -367,6 +510,7 @@ mod tests {
         let got = tokio::time::timeout(Duration::from_secs(10), wait_for_credentials(Some("old".into()))).await.unwrap();
         assert_eq!(got.token, "new"); // the expired token in the file is not accepted
         let _ = std::fs::remove_dir_all(&dir);
+        });
     }
 
     #[test]

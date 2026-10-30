@@ -24,10 +24,40 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential pkg-config \
-            libx11-dev libxext-dev libxtst-dev libxfixes-dev libgtk-3-dev
+            libx11-dev libxext-dev libxtst-dev libxfixes-dev libgtk-3-dev \
+            libwayland-dev libwayland-bin libxkbcommon-dev
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --locked
+      # Same as the release job: the wayland plugin is built on 22.04; libei is unavailable here, so
+      # the portal plugin is skipped with a warning (release builds it on 24.04).
+      - name: Release feature set
+        run: |
+          cargo build --locked --features wayland,portal,engine-plugins --bin uuremote-server
+          test -f target/debug/libuu-wayland.so
+      - name: Debian package installs
+        run: |
+          packaging/deb/build-deb.sh 0.0.0~ci target/debug /tmp/deb
+          dpkg-deb -I /tmp/deb/*.deb | grep -E 'Depends|Recommends'
+          sudo apt-get install -y /tmp/deb/*.deb
+          uuremote-server --help | head -1
+          test -f /usr/lib/uu-remote-linux/libuu-wayland.so
+          systemd-analyze verify /usr/lib/systemd/user/uuremote-native.service
+      # The tarball installer must bring FFmpeg back on a machine without it (no FFmpeg = no picture).
+      - name: Tarball install script
+        run: |
+          shellcheck packaging/tarball/install.sh
+          sudo apt-get remove -y ffmpeg || true
+          if command -v ffmpeg; then echo "ffmpeg still present"; exit 1; fi
+          pkg=$(mktemp -d)
+          cp target/debug/uuremote-server target/debug/libuu-wayland.so packaging/tarball/install.sh "$pkg/"
+          cp -r contrib "$pkg/"
+          home=$(mktemp -d)
+          HOME=$home XDG_CONFIG_HOME=$home/.config "$pkg/install.sh" --yes
+          ffmpeg -hide_banner -encoders | grep -qw libx264
+          test -x "$home/.local/bin/uuremote-server" && test -f "$home/.local/lib/uu-remote-linux/libuu-wayland.so"
+          grep -q '^ExecStart=%h/.local/bin/uuremote-server$' "$home/.config/systemd/user/uuremote-native.service"
+          HOME=$home XDG_CONFIG_HOME=$home/.config "$pkg/install.sh" --yes | grep -q 'Kept existing'
 
   test-viewer:
     runs-on: ubuntu-22.04
@@ -56,12 +86,18 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --locked --features wayland,portal
+      # Release layout: engines as runtime-loaded plugins; uuremote-server must not link them.
+      - name: Engine plugins
+        run: |
+          cargo build --locked --features wayland,portal,engine-plugins --bin uuremote-server
+          for lib in libuu-wayland.so libuu-portal.so; do test -f "target/debug/$lib"; done
+          ! readelf -d target/debug/uuremote-server | grep NEEDED | grep -E 'libei|libpipewire|libwayland-client|libxkbcommon'
       - name: Native portal and EIS regression tests (ASan/UBSan)
         env:
           ASAN_OPTIONS: detect_leaks=1
           UBSAN_OPTIONS: halt_on_error=1
         run: |
-          for source in tests/portal_engine.c tests/portal_input.c tests/portal_eis.c tests/desktop_power.c; do
+          for source in tests/portal_engine.c tests/portal_input.c tests/portal_eis.c tests/desktop_power.c tests/wayland_transform.c; do
             target="/tmp/$(basename "$source" .c)"
             cc -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
               -Wall -Wextra -Wno-unused-parameter "$source" -o "$target" \
@@ -73,12 +109,37 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - name: Install build dependencies (X11 + FFmpeg 6 for the inproc-av feature)
+      - name: Install build dependencies (X11; inproc-av vendors the NVENC headers; the VAAPI/DRI3 engines need libva/gbm/xcb-dri3 headers, libva itself is dlopen'ed at runtime)
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential pkg-config \
             libx11-dev libxext-dev libxtst-dev libxfixes-dev libgtk-3-dev \
-            libavcodec-dev libavformat-dev libavdevice-dev libswscale-dev libclang-dev
+            libva-dev libgbm-dev libx11-xcb-dev libxcb-dri3-dev libxcb-damage0-dev
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --locked --features inproc-av
+
+  test-linux-arm64:
+    # aarch64 hosts (Ampere A1, arm64 VMs, Apple-silicon VMs) build from source, so keep that
+    # build honest on a native arm64 runner instead of letting it rot between releases.
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config \
+            libx11-dev libxext-dev libxtst-dev libxfixes-dev libgtk-3-dev \
+            libwayland-dev libwayland-bin libxkbcommon-dev libglib2.0-dev libpipewire-0.3-dev libei-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked
+      - name: Release binary
+        run: |
+          cargo build --locked --release --bin uuremote-server
+          file target/release/uuremote-server
+      # The aarch64 release package ships both engine plugins.
+      - name: Release feature set
+        run: |
+          cargo build --locked --features wayland,portal,engine-plugins --bin uuremote-server
+          for lib in libuu-wayland.so libuu-portal.so; do test -f "target/debug/$lib"; done

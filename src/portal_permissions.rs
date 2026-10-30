@@ -26,6 +26,9 @@ pub fn desktop_key() -> &'static str {
     if desktop.split(':').any(|v| v == "kde") { "kde" } else { "gnome" }
 }
 
+/// Consent for one monitor (Mutter connector); connectors are checked to be file-name safe.
+pub fn monitor_key(connector: &str) -> String { format!("{}@{}", desktop_key(), connector) }
+
 pub fn load(dir: &Path, key: &str) -> Option<String> {
     let path = dir.join(key);
     let mut file = OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(&path).ok()?;
@@ -67,6 +70,12 @@ mod tests {
         // A failed open must leave the token for the next attempt.
         assert_eq!(load(&dir, "kde").as_deref(), Some("test-token"));
         save(&dir, "kde", "next-token").unwrap();
+        assert_eq!(load(&dir, "kde").as_deref(), Some("next-token"));
+        // Per-monitor consent uses the same persistent cache without replacing the desktop fallback.
+        let monitor = monitor_key("DP-1");
+        save(&dir, &monitor, "monitor-token").unwrap();
+        assert_eq!(load(&dir, &monitor).as_deref(), Some("monitor-token"));
+        assert_eq!(load(&dir, &monitor).as_deref(), Some("monitor-token"));
         assert_eq!(load(&dir, "kde").as_deref(), Some("next-token"));
         save(&dir, "gnome", "second-token").unwrap();
         fs::remove_file(dir.join("kde")).unwrap();
