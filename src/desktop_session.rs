@@ -298,6 +298,12 @@ impl PortalDesktop {
             }
             open(screen, worker_cancel)
         }).await;
+        // GNOME can reject a restore before logind's one-second lock watcher notices
+        // the lock. Keep the outer wait_for_lock select alive through that gap;
+        // actual consent denial remains terminal and must not loop prompts.
+        if matches!(&result, Ok(Err(error)) if error.code == 4) {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
         if !owner.is_current() || *locked.borrow() != Some(false) {
             return AttemptOutcome::Cancelled;
         }
@@ -478,6 +484,58 @@ mod tests {
         assert!(!flag.load(Ordering::Acquire));
         drop(guard);
         assert!(flag.load(Ordering::Acquire));
+    }
+    #[tokio::test]
+    async fn permission_failure_before_lock_recovers_on_unlock_without_reconnecting() {
+        let (lock, locked) = watch::channel(Some(false));
+        let host = Arc::new(PortalDesktop::with_lock_state(
+            Arc::new(ScreenCapture::unavailable("pending".into())), locked));
+        let input = Arc::new(crate::input::InputInjector::without_desktop());
+        let owner = input.desktop_session();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let (failed, mut failed_rx) = tokio::sync::mpsc::unbounded_channel();
+        let task = tokio::spawn({
+            let host = host.clone();
+            let attempts = attempts.clone();
+            async move {
+                host.maintain_with(owner, || Ok(()), IdleGuard::default,
+                    move |_, _| {
+                        if attempts.fetch_add(1, Ordering::Relaxed) == 0 {
+                            failed.send(()).unwrap();
+                            Err(PortalError { code: 4 })
+                        } else { Ok(ready_screen()) }
+                    }).await
+            }
+        });
+        failed_rx.recv().await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        lock.send(Some(true)).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        assert!(!task.is_finished(), "a lock-related rejection must not end recovery");
+        assert!(!host.snapshot().ready());
+        assert_eq!(attempts.load(Ordering::Relaxed), 1, "do not prompt while locked");
+        lock.send(Some(false)).unwrap();
+        let mut updates = host.subscribe();
+        tokio::time::timeout(std::time::Duration::from_secs(3), updates.wait_for(|s| s.ready()))
+            .await.expect("same desktop must recover after unlock").unwrap();
+        assert_eq!(attempts.load(Ordering::Relaxed), 2);
+        task.abort();
+        let _ = task.await;
+    }
+    #[tokio::test]
+    async fn permission_denial_without_lock_still_stops_after_one_attempt() {
+        let (_lock, locked) = watch::channel(Some(false));
+        let host = PortalDesktop::with_lock_state(
+            Arc::new(ScreenCapture::unavailable("pending".into())), locked);
+        let input = Arc::new(crate::input::InputInjector::without_desktop());
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let count = attempts.clone();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(4),
+            host.maintain_with(input.desktop_session(), || Ok(()), IdleGuard::default,
+                move |_, _| { count.fetch_add(1, Ordering::Relaxed); Err(PortalError { code: 4 }) }))
+            .await.expect("real consent rejection must remain terminal");
+        assert!(result.is_err());
+        assert_eq!(attempts.load(Ordering::Relaxed), 1);
     }
     #[tokio::test]
     async fn lock_transition_cancels_blocked_attempt_and_releases_inhibitor() {
