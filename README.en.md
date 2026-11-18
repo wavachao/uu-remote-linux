@@ -313,6 +313,26 @@ X11 keeps XTest by default because it handles held keys correctly on high-latenc
 
 ASCII text mapping through uinput requires X11/XWayland XKB; unmappable text keeps the existing text/clipboard path.
 
+#### KDE lock-screen access on Ubuntu 26.04
+
+Install Plasma Wayland and the KDE Portal alongside Ubuntu Desktop with GDM as the login manager.
+
+```sh
+sudo apt install --no-install-recommends \
+    kde-plasma-desktop plasma-session-wayland xdg-desktop-portal-kde \
+    systemsettings powerdevil kscreen
+```
+
+Apply the uinput rule above so the active desktop user can send remote keystrokes while locked. Choose **Plasma (Wayland)** in GDM at the next login. GDM remembers the selection for that account. To set it over SSH, run the following as the desktop user.
+
+```sh
+account="/org/freedesktop/Accounts/User$(id -u)"
+sudo busctl --system call org.freedesktop.Accounts "$account" org.freedesktop.Accounts.User SetSessionType s wayland
+sudo busctl --system call org.freedesktop.Accounts "$account" org.freedesktop.Accounts.User SetSession s plasma
+```
+
+After logging in to Plasma, connect once with UU while the desktop is unlocked and approve KDE screen sharing. Then lock the desktop, reconnect and type your Linux login password with the remote keyboard. This requires an existing Plasma desktop session.
+
 ## Remote assistance and the main window (experimental)
 
 As in the official client, this host shows a **device ID** and a **verification code**; whoever you give them to can

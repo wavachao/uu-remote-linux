@@ -289,6 +289,26 @@ X11 默认继续用 XTest，因为它能正确处理网络延迟下按住不放�
 
 uinput 的 ASCII 文本映射依赖 X11/XWayland XKB；不可映射的文字保留原有文字输入/剪贴板路径。
 
+#### Ubuntu 26.04 上的 KDE 锁屏远控
+
+在已有的 Ubuntu Desktop 上安装 Plasma Wayland 和 KDE Portal，继续使用 GDM 登录界面。
+
+```sh
+sudo apt install --no-install-recommends \
+    kde-plasma-desktop plasma-session-wayland xdg-desktop-portal-kde \
+    systemsettings powerdevil kscreen
+```
+
+配置本节的 uinput 规则，允许当前桌面用户在锁屏时使用远程键盘。下次登录时，在 GDM 选 **Plasma (Wayland)**。GDM 会记住该账号的选择。也可以用桌面账号通过 SSH 预设下次登录会话。
+
+```sh
+account="/org/freedesktop/Accounts/User$(id -u)"
+sudo busctl --system call org.freedesktop.Accounts "$account" org.freedesktop.Accounts.User SetSessionType s wayland
+sudo busctl --system call org.freedesktop.Accounts "$account" org.freedesktop.Accounts.User SetSession s plasma
+```
+
+重新登录后，在桌面解锁时先用 UU 连接一次并确认 KDE 的屏幕共享授权。随后锁屏再连接，使用远程键盘输入 Linux 登录密码。这条路径需要已有的 Plasma 桌面会话。
+
 ## 远程协助与主窗口（实验性）
 
 和官方客户端的「远程协助」一样：本机显示**设备 ID** 和**验证码**，把它们发给信任的人，对方在 UU 远程的「开始协助」里输入即可控制本机。
