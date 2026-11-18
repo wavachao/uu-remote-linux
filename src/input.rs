@@ -43,6 +43,28 @@ struct PendingPointer {
 unsafe fn x11_pointer_state(_: *mut libc::c_int,_:*mut libc::c_int,_:*mut libc::c_uint)->libc::c_int {-1}
 #[derive(Default)]
 struct HeldInput { buttons: std::collections::BTreeSet<i32>, keys: std::collections::BTreeSet<u64> }
+/// Inputs held through the portal session are dropped when that session is replaced; the
+/// cursor-mode rebuild waits until they are released. uinput devices survive the swap.
+static PORTAL_INPUT_HELD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// An active contact on the portal touchscreen is also lost when the session is replaced.
+static PORTAL_TOUCH_HELD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub fn portal_input_held() -> bool {
+    PORTAL_INPUT_HELD.load(std::sync::atomic::Ordering::Relaxed) || PORTAL_TOUCH_HELD.load(std::sync::atomic::Ordering::Relaxed)
+}
+/// Inputs currently bound to the portal session; a replacement tears those devices down.
+static PORTAL_HELD: std::sync::Mutex<HeldInput> = std::sync::Mutex::new(HeldInput { buttons: std::collections::BTreeSet::new(), keys: std::collections::BTreeSet::new() });
+/// Serializes recording an input with retiring the records of a replaced handle.
+static PORTAL_HELD_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+pub fn lock_portal_held() -> std::sync::MutexGuard<'static, ()> {
+    PORTAL_HELD_SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+/// The portal replaced its native devices: records of held portal inputs no longer apply.
+/// The caller holds `lock_portal_held()`, so an input recorded against the new handle stays.
+pub fn portal_session_replaced() {
+    if let Ok(mut held)=PORTAL_HELD.lock() { *held=HeldInput::default(); }
+    PORTAL_INPUT_HELD.store(false, std::sync::atomic::Ordering::Relaxed);
+    PORTAL_TOUCH_HELD.store(false, std::sync::atomic::Ordering::Relaxed);
+}
 /// Held modifier VKs (bit 0 Ctrl, 1 Shift, 2 Alt, 3 Win) and keys that got a synthetic Shift.
 #[derive(Default)]
 struct Shortcuts { modifiers: u8, shifted: std::collections::BTreeSet<i32> }
@@ -81,15 +103,22 @@ fn finger_held(finger: Finger, now: std::time::Instant) -> Option<(i32,i32)> {
 /// Viewer platform from the connect header `controller_platform` (website enum: 1 windows, 2 android,
 /// 3 ios, 4 macos, 5 tv).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Controller { #[default] Other, Mac, Mobile }
+pub enum Controller { #[default] Other, Windows, Mac, Mobile, Ios }
 impl Controller {
+    /// Touch semantics cover both mobile platforms; the iOS RPC 7 screen-off encoding is its own quirk.
+    pub fn is_mobile(self) -> bool { matches!(self, Self::Mobile | Self::Ios) }
     pub fn from_platform(platform: Option<&serde_json::Value>) -> Self {
         let Some(v) = platform else { return Self::Other };
         let text = v.as_str().map(str::to_ascii_lowercase);
         match v.as_i64().or_else(|| text.as_deref().and_then(|s| s.parse().ok())) {
             Some(4) => Self::Mac,
-            Some(2 | 3) => Self::Mobile,
-            _ if text.is_some_and(|s| s.contains("mac") || s.contains("darwin")) => Self::Mac,
+            Some(3) => Self::Ios,
+            Some(2) => Self::Mobile,
+            Some(1) => Self::Windows,
+            _ if text.as_deref().is_some_and(|s| s.contains("mac") || s.contains("darwin")) => Self::Mac,
+            _ if text.as_deref().is_some_and(|s| s.contains("ios") || s.contains("iphone") || s.contains("ipad")) => Self::Ios,
+            _ if text.as_deref().is_some_and(|s| s.contains("android")) => Self::Mobile,
+            _ if text.as_deref().is_some_and(|s| s.contains("windows")) => Self::Windows,
             _ => Self::Other,
         }
     }
@@ -99,7 +128,27 @@ impl Controller {
 #[derive(Default)]
 struct CmdState { held: bool, pending: bool, passthrough: bool, combos: std::collections::BTreeMap<i32, bool> }
 
-pub struct InputInjector { mac_controller: std::sync::atomic::AtomicBool, cmd: std::sync::Mutex<CmdState>, serial:std::sync::Mutex<()>, owner:std::sync::Mutex<DesktopOwner>, shortcuts: std::sync::Mutex<Shortcuts>, uinput: Option<crate::uinput::Devices>, screen: std::sync::Mutex<(u32,u32)>, portal_failures: std::sync::atomic::AtomicUsize, portal_outcomes: [std::sync::atomic::AtomicUsize; 3], portal:std::sync::Mutex<Option<std::sync::Arc<crate::portal::PortalSession>>>, backend: crate::desktop_backend::DesktopBackend, pending: std::sync::Mutex<PendingPointer>, held: std::sync::Mutex<HeldInput>, touch: std::sync::Mutex<TouchDrag> }
+pub struct InputInjector { mac_controller: std::sync::atomic::AtomicBool, cmd: std::sync::Mutex<CmdState>, serial:std::sync::Mutex<()>, owner:std::sync::Mutex<DesktopOwner>, shortcuts: std::sync::Mutex<Shortcuts>, uinput: Option<crate::uinput::Devices>, uinput_pointer: bool, screen: std::sync::Mutex<(u32,u32)>, portal_failures: std::sync::atomic::AtomicUsize, portal_outcomes: [std::sync::atomic::AtomicUsize; 3], portal:std::sync::Mutex<Option<std::sync::Arc<crate::portal::PortalSession>>>, backend: crate::desktop_backend::DesktopBackend, pending: std::sync::Mutex<PendingPointer>, held: std::sync::Mutex<HeldInput>, touch: std::sync::Mutex<TouchDrag>, pointer_wake: tokio::sync::Notify }
+
+fn active_output_count(json: &[u8]) -> Option<usize> {
+    let data: serde_json::Value = serde_json::from_slice(json).ok()?;
+    Some(data.get("outputs")?.as_array()?.iter()
+        .filter(|o| o["enabled"] == true && o["connected"] == true).count())
+}
+fn single_portal_output() -> bool {
+    if cfg!(test) { return false; }
+    let monitors = crate::portal::monitors();
+    if !monitors.is_empty() { return monitors.len() == 1; }
+    // KDE has no Mutter monitor API. Query once at injector creation, never during input.
+    std::process::Command::new("timeout").args(["2s", "kscreen-doctor", "-j"]).output().ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| active_output_count(&output.stdout)) == Some(1)
+}
+
+/// The desktop injector opened uinput devices. The privacy screen needs them: KDE ignores portal
+/// input on its virtual-output share, so without uinput nobody could operate the desktop.
+static UINPUT_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub fn uinput_ready() -> bool { UINPUT_READY.load(std::sync::atomic::Ordering::Acquire) }
 
 impl InputInjector {
     pub fn new() -> Self {
@@ -110,7 +159,12 @@ impl InputInjector {
                 Err(e) => { log::warn!("uinput unavailable ({}); using the desktop input path. See README for the udev rule.", e.kind()); None }
             }
         } else { None };
-        Self { mac_controller: std::sync::atomic::AtomicBool::new(false), cmd: std::sync::Mutex::new(CmdState::default()), serial:std::sync::Mutex::new(()), owner:std::sync::Mutex::new(DesktopOwner::default()), shortcuts: std::sync::Mutex::new(Shortcuts::default()), uinput, screen: std::sync::Mutex::new((0,0)), portal_failures: std::sync::atomic::AtomicUsize::new(0), portal_outcomes: std::array::from_fn(|_| std::sync::atomic::AtomicUsize::new(0)), portal:std::sync::Mutex::new(None), backend:crate::desktop_backend::detect().unwrap_or(crate::desktop_backend::DesktopBackend::X11), pending: std::sync::Mutex::new(PendingPointer::default()), held:std::sync::Mutex::new(HeldInput::default()), touch:std::sync::Mutex::new(TouchDrag::default()) }
+        if uinput.is_some() { UINPUT_READY.store(true, std::sync::atomic::Ordering::Release); }
+        let uinput_pointer = uinput.is_some() && (std::env::var("UU_INPUT_BACKEND").as_deref() == Ok("uinput")
+            || (backend == crate::desktop_backend::DesktopBackend::Portal && single_portal_output()));
+        if uinput_pointer { log::info!("Input pointer backend: uinput (motion, buttons and wheel)"); }
+        else if backend == crate::desktop_backend::DesktopBackend::Portal { log::info!("Input pointer backend: portal (monitor-local coordinates)"); }
+        Self { mac_controller: std::sync::atomic::AtomicBool::new(false), cmd: std::sync::Mutex::new(CmdState::default()), serial:std::sync::Mutex::new(()), owner:std::sync::Mutex::new(DesktopOwner::default()), shortcuts: std::sync::Mutex::new(Shortcuts::default()), uinput, uinput_pointer, screen: std::sync::Mutex::new((0,0)), portal_failures: std::sync::atomic::AtomicUsize::new(0), portal_outcomes: std::array::from_fn(|_| std::sync::atomic::AtomicUsize::new(0)), portal:std::sync::Mutex::new(None), backend, pending: std::sync::Mutex::new(PendingPointer::default()), held:std::sync::Mutex::new(HeldInput::default()), touch:std::sync::Mutex::new(TouchDrag::default()), pointer_wake: tokio::sync::Notify::new() }
     }
 
     pub fn bind_portal(&self,session:Option<std::sync::Arc<crate::portal::PortalSession>>) {
@@ -128,6 +182,7 @@ impl InputInjector {
             let mut pending = self.pending.lock().unwrap();
             pending.absolute = Some(position);
             pending.relative = (0,0);
+            self.pointer_wake.notify_one();
         }
     }
     pub fn mouse_relative(&self, dx: i32, dy: i32) {
@@ -135,6 +190,7 @@ impl InputInjector {
             let mut pending = self.pending.lock().unwrap();
             pending.relative.0 = (pending.relative.0 + i64::from(dx)).clamp(-65535,65535);
             pending.relative.1 = (pending.relative.1 + i64::from(dy)).clamp(-65535,65535);
+            self.pointer_wake.notify_one();
         }
     }
     pub fn mouse_scroll(&self, dx: i32, dy: i32) {
@@ -142,14 +198,37 @@ impl InputInjector {
         let mut pending = self.pending.lock().unwrap();
         pending.scroll.0 = (pending.scroll.0 + i64::from(dx)).clamp(-12000,12000);
         pending.scroll.1 = (pending.scroll.1 + i64::from(dy)).clamp(-12000,12000);
+        self.pointer_wake.notify_one();
     }
     pub fn start_pointer_worker(self: &std::sync::Arc<Self>) -> tokio::task::JoinHandle<()> {
         let input = self.clone();
         tokio::spawn(async move {
+            // Parked until pointer work exists: a fixed 4 ms tick burned ~250 wakeups/s
+            // (≈3% CPU with pow-heavy flush math) even with no viewer connected.
+            // notify_one() stores a permit, so an event racing the park check cannot be lost.
             let mut tick = tokio::time::interval(std::time::Duration::from_millis(4));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop { tick.tick().await; input.flush_pointer(); }
+            loop {
+                input.pointer_wake.notified().await;
+                // The first event is immediate; later events coalesce until the next tick.
+                tick.reset();
+                loop {
+                    input.flush_pointer();
+                    tick.tick().await;
+                    if input.pointer_idle() { break; }
+                }
+            }
         })
+    }
+    /// Whether the worker may park: nothing accumulated, no full scroll notch waiting and no
+    /// touch gesture in flight (`Pending` needs ticks until its hold resolves, `Scroll`/`Select`
+    /// and `down` until release). Sub-notch scroll residue cannot inject alone, so it parks.
+    fn pointer_idle(&self) -> bool {
+        let pending = self.pending.lock().unwrap();
+        let touch = self.touch.lock().unwrap();
+        pending.absolute.is_none() && pending.relative == (0,0)
+            && pending.scroll.0 / 120 == 0 && pending.scroll.1 / 120 == 0
+            && !touch.down && touch.finger == Finger::Up
     }
     pub fn discard_pointer(&self) { *self.pending.lock().unwrap() = PendingPointer::default(); }
     pub fn flush_pointer(&self) {
@@ -204,6 +283,8 @@ impl InputInjector {
     }
     pub fn mouse_button(&self, button: i32, is_press: bool) {
         let _serial=self.serial.lock().unwrap();
+        // The worker cannot consume the wake and flush until this transition is published.
+        self.pointer_wake.notify_one();
         self.flush_pointer_locked();
         if button == 1 && self.touch_button(is_press) { return; }
         let result = self.inject_button(button,is_press);
@@ -251,7 +332,7 @@ impl InputInjector {
         *self.cmd.lock().unwrap() = CmdState::default();
         let mut touch = self.touch.lock().unwrap();
         self.lift_finger(&mut touch);
-        let mode = if controller != Controller::Mobile { TouchMode::Mouse } else {
+        let mode = if !controller.is_mobile() || self.uinput_pointer { TouchMode::Mouse } else {
             match std::env::var("UU_TOUCH_INPUT").as_deref() { Ok("0") => TouchMode::Mouse, Ok("touch") => TouchMode::Touch, _ => TouchMode::Gesture }
         };
         *touch = TouchDrag { mode, ..TouchDrag::default() };
@@ -303,7 +384,8 @@ impl InputInjector {
             };
         }
         if touch.finger != Finger::Up { return true }
-        let bound = self.backend == crate::desktop_backend::DesktopBackend::Portal && self.portal.lock().unwrap().is_some();
+        // Gesture scrolling is portal-only; on the privacy screen's virtual share drags stay mouse drags.
+        let bound = self.backend == crate::desktop_backend::DesktopBackend::Portal && self.portal.lock().unwrap().is_some() && !self.virtual_uinput();
         let Some(start) = touch.at.filter(|_| bound) else { return false };
         static REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         if !REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) { log::info!("Mobile controller drag input: gesture (drag scrolls, hold selects)"); }
@@ -328,8 +410,20 @@ impl InputInjector {
         });
     }
     fn inject_touch(&self, phase: i32, x: i32, y: i32) -> i32 {
+        // Serialize the contact with handle replacement: a contact sent to the new devices
         let Some(portal) = self.portal.lock().unwrap().clone() else { return -1 };
-        self.portal_result("touch", portal.touch(phase, f64::from(x), f64::from(y)))
+        // Serialize with handle replacement while the contact is sent; portal then recording
+        // lock, the same order the button and key recorders use.
+        let _serial = lock_portal_held();
+        let result = self.portal_result("touch", portal.touch(phase, f64::from(x), f64::from(y)));
+        if result == 0 {
+            match phase {
+                0 => PORTAL_TOUCH_HELD.store(true, std::sync::atomic::Ordering::Relaxed),
+                2 => PORTAL_TOUCH_HELD.store(false, std::sync::atomic::Ordering::Relaxed),
+                _ => {}
+            }
+        }
+        result
     }
 
     fn terminal_focused(&self) -> bool {
@@ -444,6 +538,16 @@ impl InputInjector {
             if !keys_ok {log::warn!("Desktop input reset incomplete: backend unavailable");}
         }
         *held=HeldInput::default();
+        // Inputs bound to the portal session are not covered by the uinput release above.
+        let (portal_buttons, portal_keys) = {
+            let _serial=lock_portal_held();
+            let mut pending=PORTAL_HELD.lock().unwrap();
+            (std::mem::take(&mut pending.buttons), std::mem::take(&mut pending.keys))
+        };
+        // Stop on the first failure like the sweep above: each call can wait out the portal timeout.
+        let buttons_ok = portal_buttons.into_iter().all(|button| self.inject_button(button,false)==0);
+        if buttons_ok { for key in portal_keys { if self.inject_key(key,false)!=0 { break; } } }
+        PORTAL_INPUT_HELD.store(false,std::sync::atomic::Ordering::Relaxed);
         *self.shortcuts.lock().unwrap()=Shortcuts::default();
         *self.cmd.lock().unwrap()=CmdState::default();
     }
@@ -477,7 +581,37 @@ impl InputInjector {
             }
         }
     }
+    /// Inputs bound to the portal session are dropped when that session is replaced.
+    fn record_portal_button(&self, button: i32, pressed: bool) {
+        // Callers hold the serial lock across the injection they are recording.
+        let mut held = PORTAL_HELD.lock().unwrap();
+        if pressed { held.buttons.insert(button); } else { held.buttons.remove(&button); }
+        PORTAL_INPUT_HELD.store(!held.buttons.is_empty() || !held.keys.is_empty(), std::sync::atomic::Ordering::Relaxed);
+    }
+    fn record_portal_key(&self, symbol: u64, pressed: bool) {
+        let mut held = PORTAL_HELD.lock().unwrap();
+        if pressed { held.keys.insert(symbol); } else { held.keys.remove(&symbol); }
+        PORTAL_INPUT_HELD.store(!held.buttons.is_empty() || !held.keys.is_empty(), std::sync::atomic::Ordering::Relaxed);
+    }
     fn inject_move(&self,x:i32,y:i32,relative:bool)->i32 {
+        // The viewer's mouse mode decides whether the stream must carry the pointer (see
+        // portal::note_pointer_motion); only the portal backend can change that.
+        if self.backend==crate::desktop_backend::DesktopBackend::Portal { crate::portal::note_pointer_motion(relative); }
+        if self.uinput_pointer && self.backend != crate::desktop_backend::DesktopBackend::X11 {
+            if let Some(uinput) = &self.uinput {
+                if relative { return Self::uinput_result(uinput.move_relative(x,y)); }
+                let (w,h) = *self.screen.lock().unwrap();
+                if w > 1 && h > 1 {
+                    let (ax, ay) = self.privacy_absolute(x, y, (w, h)).unwrap_or_else(|| {
+                        let scale = |v: i32, extent: u32| (i64::from(v).clamp(0, i64::from(extent - 1))
+                            * i64::from(crate::uinput::ABS_MAX) / i64::from(extent - 1)) as i32;
+                        (scale(x, w), scale(y, h))
+                    });
+                    return Self::uinput_result(uinput.move_absolute(ax, ay));
+                }
+                return -1;
+            }
+        }
         // uinput ABS axes span the compositor's whole desktop. A captured output
         // uses its own pixel space; bind absolute motion to that Wayland output,
         // including when uinput remains in use for keyboard/buttons/relative input.
@@ -490,7 +624,12 @@ impl InputInjector {
         // Portal (GNOME/KDE): absolute motion is addressed to the shared stream, i.e. the captured
         // monitor; a uinput tablet would stretch the point across every monitor of the desktop.
         if !relative && self.backend==crate::desktop_backend::DesktopBackend::Portal {
-            if let Some(portal)=self.portal.lock().unwrap().as_ref() { return self.portal_result("motion", portal.move_pointer(f64::from(x),f64::from(y),false)); }
+            // Privacy screen: KDE accepts absolute motion for a virtual-output stream but does not
+            // move the pointer. The physical outputs are disabled then, so the uinput tablet's
+            // desktop-wide axes cover exactly the virtual output.
+            if !self.virtual_uinput() {
+                if let Some(portal)=self.portal.lock().unwrap().as_ref() { return self.portal_result("motion", portal.move_pointer(f64::from(x),f64::from(y),false)); }
+            }
         }
         // X11 multi-screen: the point is inside the selected monitor; XTest and uinput span the root.
         let placement=if relative || self.backend!=crate::desktop_backend::DesktopBackend::X11 {None} else {crate::wayland::x11_placement()};
@@ -500,6 +639,7 @@ impl InputInjector {
             let (w,h)=placement.and_then(|_|crate::capture::x11_last_size()).unwrap_or(*self.screen.lock().unwrap());
             if w > 1 && h > 1 {
                 let scale = |v: i32, extent: u32| (i64::from(v) * i64::from(crate::uinput::ABS_MAX) / i64::from(extent - 1)) as i32;
+                if let Some((ax, ay)) = self.privacy_absolute(x, y, (w, h)) { return Self::uinput_result(uinput.move_absolute(ax, ay)); }
                 return Self::uinput_result(uinput.move_absolute(scale(x,w),scale(y,h)));
             }
         }
@@ -509,18 +649,42 @@ impl InputInjector {
         if self.backend==crate::desktop_backend::DesktopBackend::Wayland { crate::wayland::move_pointer(x,y,relative) }
         else if relative { unsafe { x11_mouse_relative(x,y) } } else { unsafe { x11_mouse_move(x,y) } }
     }
+    /// Privacy picture mode keeps the physical outputs on, so uinput's axes span them too: aim the
+    /// stream point inside the virtual output's region of the layout.
+    fn privacy_absolute(&self, x: i32, y: i32, (w, h): (u32, u32)) -> Option<(i32, i32)> {
+        let [rx, ry, rw, rh] = crate::privacy_screen::pointer_region().filter(|_| self.virtual_uinput())?;
+        let abs = |v: i32, extent: u32, o: f64, span: f64| ((o + f64::from(v.clamp(0, extent as i32 - 1)) / f64::from(extent - 1) * span)
+            * f64::from(crate::uinput::ABS_MAX)).round() as i32;
+        Some((abs(x, w, rx, rw), abs(y, h, ry, rh)))
+    }
+    /// Privacy screen: KDE ignores portal pointer events (motion and buttons) on a virtual-output
+    /// share, so the pointer uses uinput, whose axes then span just the virtual output.
+    fn virtual_uinput(&self)->bool {
+        self.uinput.is_some() && self.portal.lock().unwrap().as_ref().is_some_and(|p| p.is_virtual())
+    }
     fn inject_button(&self,button:i32,pressed:bool)->i32 {
         // Portal: clicks follow absolute motion on the same session, so a tap cannot land
         // before the compositor has moved the pointer there (uinput is a separate queue).
-        if self.backend==crate::desktop_backend::DesktopBackend::Portal {
-            if let Some(portal)=self.portal.lock().unwrap().as_ref() { return self.portal_result("button", portal.button(button,pressed)); }
+        if !self.uinput_pointer && self.backend==crate::desktop_backend::DesktopBackend::Portal && !self.virtual_uinput() {
+            if let Some(portal)=self.portal.lock().unwrap().as_ref() {
+                // The injection and its record must both predate or both postdate a swap.
+                let _serial=lock_portal_held();
+                let result=self.portal_result("button", portal.button(button,pressed));
+                if result==0 { self.record_portal_button(button,pressed); }
+                return result;
+            }
         }
         if let Some(uinput)=&self.uinput {
             if let Some((v,h))=crate::uinput::wheel_step(button) { return if pressed { Self::uinput_result(uinput.wheel(v,h)) } else { 0 }; }
             if let Some(code)=crate::uinput::button_code(button) { return Self::uinput_result(uinput.button(code,pressed)); }
         }
         if self.backend==crate::desktop_backend::DesktopBackend::Kms { return -1; }
-        if let Some(portal)=self.portal.lock().unwrap().as_ref() { return self.portal_result("button", portal.button(button,pressed)); }
+        if let Some(portal)=self.portal.lock().unwrap().as_ref() {
+            let _serial=lock_portal_held();
+            let result=self.portal_result("button", portal.button(button,pressed));
+            if result==0 { self.record_portal_button(button,pressed); }
+            return result;
+        }
         if self.backend==crate::desktop_backend::DesktopBackend::Portal {return self.portal_result("button", Err("Portal input session is not bound".into()));}
         if self.backend==crate::desktop_backend::DesktopBackend::Wayland { crate::wayland::button(button,pressed) }
         else { unsafe { x11_mouse_button(button,i32::from(pressed)) } }
@@ -530,7 +694,12 @@ impl InputInjector {
             if let Some(code)=crate::uinput::keysym_to_evdev(symbol) { return Self::uinput_result(uinput.key(code,pressed)); }
         }
         if self.backend==crate::desktop_backend::DesktopBackend::Kms { return -1; }
-        if let Some(portal)=self.portal.lock().unwrap().as_ref() { return self.portal_result("keyboard", portal.key(symbol,pressed)); }
+        if let Some(portal)=self.portal.lock().unwrap().as_ref() {
+            let _serial=lock_portal_held();
+            let result=self.portal_result("keyboard", portal.key(symbol,pressed));
+            if result==0 { self.record_portal_key(symbol,pressed); }
+            return result;
+        }
         if self.backend==crate::desktop_backend::DesktopBackend::Portal {return self.portal_result("keyboard", Err("Portal input session is not bound".into()));}
         if self.backend==crate::desktop_backend::DesktopBackend::Wayland { crate::wayland::key(symbol,pressed) }
         else { unsafe { x11_key_symbol(symbol as libc::c_ulong,i32::from(pressed)) } }
@@ -619,11 +788,67 @@ impl InputInjector {
         true
     }
 
-    /// Mobile input-method text (`text_input`). X11 types it directly; Wayland re-maps a spare
-    /// keycode in the virtual keyboard's keymap. Portal and other Wayland environments inject
-    /// via clipboard paste (Shift+Insert). Set UU_WAYLAND_TEXT=0 to disable Wayland text injection.
+    fn emit_uinput_text(&self, plan: &[crate::uinput::TextKey]) -> usize {
+        let Some(devices) = self.uinput.as_ref() else { return 0 };
+        let (mut typed, mut shift) = (0, 0);
+        for key in plan {
+            if key.code == 0 || key.code > 248 || key.shift > 248 { break; }
+            if shift != key.shift {
+                if shift != 0 {
+                    if Self::uinput_result(devices.key(shift, false)) != 0 { break; }
+                    shift = 0;
+                }
+                if key.shift != 0 {
+                    if Self::uinput_result(devices.key(key.shift, true)) != 0 { break; }
+                    shift = key.shift;
+                }
+            }
+            let pressed = Self::uinput_result(devices.key(key.code, true)) == 0;
+            let released = Self::uinput_result(devices.key(key.code, false)) == 0;
+            if pressed { typed += 1; }
+            if !pressed || !released { break; }
+        }
+        if shift != 0 { Self::uinput_result(devices.key(shift, false)); }
+        typed
+    }
+    fn type_uinput_text(&self, text: &str) -> usize {
+        self.type_uinput_text_when(text, || {
+            uinput_layout_types_ascii(&std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default(), gnome_layout_types_ascii)
+        })
+    }
+    fn type_uinput_text_when(&self, text: &str, layout_allowed: impl FnOnce() -> bool) -> usize {
+        if self.uinput.is_none() || !self.held.lock().unwrap().keys.is_empty() { return 0; }
+        // XKB can still report US while IBus consumes physical keys for composition.
+        // Leave committed text intact for the existing native/clipboard fallback.
+        if !layout_allowed() { return 0; }
+        self.emit_uinput_text(&crate::uinput::text_plan(text))
+    }
+
+    /// Mobile input-method text (`text_input`). X11 types directly. Native Wayland uses the text
+    /// keyboard's Unicode keysyms first: uinput sends physical keycodes, which a running input
+    /// method composes as pinyin, so "hello" would become candidates instead of text. uinput stays
+    /// as the fallback when the keymap path is unavailable. Portal and other Wayland environments
+    /// inject via clipboard paste (Shift+Insert).
+    /// Set UU_WAYLAND_TEXT=0 to disable Wayland text injection.
     pub fn text_input(&self, text: &str) {
         let _serial=self.serial.lock().unwrap();
+        if self.backend != crate::desktop_backend::DesktopBackend::X11 {
+            if std::env::var("UU_WAYLAND_TEXT").is_ok_and(|v| v == "0") { return; }
+            if self.backend == crate::desktop_backend::DesktopBackend::Wayland
+                && crate::wayland::type_utf8(text) >= 0 {
+                log::info!("Desktop text input: chars={} result=keysyms", text.chars().count());
+                return;
+            }
+            let typed = self.type_uinput_text(text);
+            if typed > 0 { log::info!("Desktop text input (uinput): chars={typed}"); }
+            if typed == text.len() { return; }
+            // The uinput planner consumes ASCII only, so the character count is also a byte offset.
+            let rest = &text[typed..];
+            return self.desktop_text_input(rest);
+        }
+        self.desktop_text_input(text);
+    }
+    fn desktop_text_input(&self, text: &str) {
         let Ok(c_text)=std::ffi::CString::new(text.replace('\0',"")) else { return };
         if self.backend==crate::desktop_backend::DesktopBackend::X11 {
             let typed=unsafe { x11_type_utf8(c_text.as_ptr()) };
@@ -675,8 +900,26 @@ impl InputInjector {
     fn type_portal_keysyms(&self, text: &str) -> usize {
         let Some(symbols)=ascii_keysyms(text) else { return 0 };
         if !gnome_layout_types_ascii() { return 0; }
+        if self.virtual_uinput() { return self.type_uinput_ascii(&symbols); }
         let Some(portal)=self.portal.lock().unwrap().clone() else { return 0 };
         symbols.iter().take_while(|&&symbol| portal.type_keysym(symbol).is_ok()).count()
+    }
+    /// Privacy screen: KDE ignores portal keysyms on a virtual-output share. Type through uinput
+    /// on the US layout the keysym path already requires, adding Shift for shifted characters.
+    fn type_uinput_ascii(&self, symbols: &[u32]) -> usize {
+        const SHIFTED: &str = "~!@#$%^&*()_+{}|:\"<>?";
+        const BASE: &str = "`1234567890-=[]\\;',./";
+        symbols.iter().take_while(|&&symbol| {
+            let c=char::from_u32(symbol).unwrap_or('\0');
+            let (base, shift)=if c.is_ascii_uppercase() { (c.to_ascii_lowercase() as u64, true) }
+                else if let Some(i)=SHIFTED.find(c) { (BASE.as_bytes()[i] as u64, true) }
+                else { (u64::from(symbol), false) };
+            if crate::uinput::keysym_to_evdev(base).is_none() { return false; }
+            if shift && self.inject_key(0xffe1, true)!=0 { return false; }
+            let ok=self.inject_key(base, true)==0 && self.inject_key(base, false)==0;
+            if shift { self.inject_key(0xffe1, false); }
+            ok
+        }).count()
     }
     pub fn key_event(&self, keycode: i32, is_press: bool) {
         let _serial=self.serial.lock().unwrap();
@@ -713,6 +956,241 @@ mod motion_tests {
         assert!(input.pending.lock().unwrap().absolute.is_none());
         input.mouse_relative(1,2); input.discard_pointer();
         assert_eq!(input.pending.lock().unwrap().relative,(0,0));
+    }
+    #[test]
+    fn parks_when_pointer_state_is_idle() {
+        let input = InputInjector::new();
+        assert!(input.pointer_idle());
+        input.mouse_relative(5,5);
+        assert!(!input.pointer_idle());
+        input.flush_pointer();
+        assert!(input.pointer_idle());
+        input.mouse_scroll(0,125); input.flush_pointer();
+        assert!(input.pointer_idle(), "sub-notch scroll residue cannot inject alone");
+    }
+    #[test]
+    fn live_touch_gesture_stays_busy_until_it_resolves() {
+        let input = InputInjector::new();
+        input.touch.lock().unwrap().finger = Finger::Pending { start: (5,5), at: std::time::Instant::now() };
+        assert!(!input.pointer_idle());
+        input.touch.lock().unwrap().finger = Finger::Scroll { last: (9,9) };
+        assert!(!input.pointer_idle());
+        *input.touch.lock().unwrap() = TouchDrag::default();
+        assert!(input.pointer_idle());
+    }
+    #[test]
+    fn button_wake_waits_for_the_serialized_transition() {
+        use futures_util::FutureExt;
+        let input = std::sync::Arc::new(InputInjector::without_desktop());
+        let serial = input.serial.lock().unwrap();
+        let ready = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let pressing = input.clone();
+        let started = ready.clone();
+        let button = std::thread::spawn(move || { started.wait(); pressing.mouse_button(1,true); });
+        ready.wait();
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
+        let premature = runtime.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_millis(50), input.pointer_wake.notified()).await.is_ok()
+        });
+        drop(serial);
+        button.join().unwrap();
+        assert!(!premature, "a parked worker must not wake before the button owns the serial lock");
+        assert!(input.pointer_wake.notified().now_or_never().is_some());
+    }
+    #[tokio::test(start_paused = true)]
+    async fn worker_coalesces_one_ms_motion_on_four_ms_ticks() {
+        let input = std::sync::Arc::new(InputInjector::without_desktop());
+        let worker = input.start_pointer_worker();
+        input.mouse_relative(1,0);
+        tokio::task::yield_now().await;
+        assert_eq!(input.portal_input_counts_for_test()[0],1, "first motion is immediate");
+        for ms in 1..=12 {
+            tokio::time::advance(std::time::Duration::from_millis(1)).await;
+            tokio::task::yield_now().await;
+            input.mouse_relative(1,0);
+            tokio::task::yield_now().await;
+            assert_eq!(input.portal_input_counts_for_test()[0],1+ms/4, "motion at {ms} ms bypassed the cadence");
+        }
+        tokio::time::advance(std::time::Duration::from_millis(4)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(input.portal_input_counts_for_test()[0],5);
+        assert_eq!(input.pending.lock().unwrap().relative,(0,0));
+        worker.abort();
+        assert!(worker.await.unwrap_err().is_cancelled());
+    }
+    #[tokio::test(start_paused = true)]
+    async fn worker_parks_and_resets_the_tick_after_a_quiet_period() {
+        let input = std::sync::Arc::new(InputInjector::without_desktop());
+        let worker = input.start_pointer_worker();
+        tokio::task::yield_now().await;
+        // Without a notification, raw queued state must remain untouched while parked.
+        input.pending.lock().unwrap().relative = (1,0);
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(input.portal_input_counts_for_test()[0],0);
+        input.mouse_relative(1,0);
+        tokio::task::yield_now().await;
+        assert_eq!(input.portal_input_counts_for_test()[0],1);
+        tokio::time::advance(std::time::Duration::from_millis(4)).await;
+        tokio::task::yield_now().await;
+        input.pending.lock().unwrap().relative = (1,0);
+        tokio::time::advance(std::time::Duration::from_millis(997)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(input.portal_input_counts_for_test()[0],1, "idle ticks must stop after activity");
+        input.mouse_relative(1,0);
+        tokio::task::yield_now().await;
+        assert_eq!(input.portal_input_counts_for_test()[0],2);
+        input.mouse_relative(1,0);
+        tokio::task::yield_now().await;
+        assert_eq!(input.portal_input_counts_for_test()[0],2, "a stale interval must not flush a second time immediately");
+        tokio::time::advance(std::time::Duration::from_millis(4)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(input.portal_input_counts_for_test()[0],3);
+        worker.abort();
+        assert!(worker.await.unwrap_err().is_cancelled());
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod kernel_pointer_tests {
+    use super::*;
+    #[test]
+    fn committed_text_with_gnome_ime_emits_no_uinput_keys() {
+        for source in ["[('ibus', 'libpinyin'), ('xkb', 'us')]", "@a(ss) []"] {
+            let (devices, mut keyboard, _) = crate::uinput::Devices::recording_for_test();
+            let mut input = InputInjector::without_desktop(); input.uinput = Some(devices);
+            let checked = std::cell::Cell::new(false);
+            let text = "fixture";
+            let typed = input.type_uinput_text_when(text, || {
+                checked.set(true);
+                uinput_layout_types_ascii("GNOME", || first_source_types_ascii(source))
+            });
+            assert!(checked.get());
+            assert_eq!(typed, 0);
+            assert!(crate::uinput::Devices::recorded_events_for_test(&mut keyboard).is_empty());
+        }
+    }
+
+    #[test]
+    fn text_plan_emits_balanced_modifiers_without_portal_or_clipboard() {
+        let (devices, mut keyboard, _) = crate::uinput::Devices::recording_for_test();
+        let mut input = InputInjector::without_desktop(); input.uinput = Some(devices);
+        let plan = [
+            crate::uinput::TextKey { code:30, shift:42 },
+            crate::uinput::TextKey { code:48, shift:42 },
+            crate::uinput::TextKey { code:2, shift:0 },
+        ];
+        assert_eq!(input.emit_uinput_text(&plan), 3);
+        let keys: Vec<_> = crate::uinput::Devices::recorded_events_for_test(&mut keyboard).into_iter()
+            .filter(|event| event.0 == 1).collect();
+        assert_eq!(keys, [(1,42,1),(1,30,1),(1,30,0),(1,48,1),(1,48,0),(1,42,0),(1,2,1),(1,2,0)]);
+        assert_eq!(input.portal_input_counts_for_test(), [0; 3]);
+    }
+
+    #[test]
+    fn partial_text_plan_releases_shift_and_does_not_disturb_held_keys() {
+        let (devices, mut keyboard, _) = crate::uinput::Devices::recording_for_test();
+        let mut input = InputInjector::without_desktop(); input.uinput = Some(devices);
+        assert_eq!(input.emit_uinput_text(&[
+            crate::uinput::TextKey { code:30, shift:42 },
+            crate::uinput::TextKey { code:0, shift:0 },
+        ]), 1);
+        let keys: Vec<_> = crate::uinput::Devices::recorded_events_for_test(&mut keyboard).into_iter()
+            .filter(|event| event.0 == 1).collect();
+        assert_eq!(keys, [(1,42,1),(1,30,1),(1,30,0),(1,42,0)]);
+        input.held.lock().unwrap().keys.insert(0xffe3);
+        assert_eq!(input.type_uinput_text("fixture"), 0);
+        assert_eq!(input.held.lock().unwrap().keys.len(), 1);
+    }
+
+    #[test]
+    #[ignore = "requires the current X11/XWayland layout; records events without desktop injection"]
+    fn committed_ascii_text_bypasses_portal_with_live_keymap() {
+        let fixture = "aAzZ09!@#$%^&*()_+-=[]{};:'\",.<>/?\\|`~\t\n";
+        assert_eq!(crate::uinput::text_plan(fixture).len(), fixture.len(), "fixture not available in idle host keymap");
+        let (devices, mut keyboard, _) = crate::uinput::Devices::recording_for_test();
+        let mut input = InputInjector::without_desktop(); input.uinput = Some(devices);
+        let input = std::sync::Arc::new(input);
+        let binding = input.portal.lock().unwrap();
+        let worker_input = input.clone();
+        let (done, received) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || { worker_input.text_input(fixture); let _ = done.send(()); });
+        // On failure panic with the binding held: poisoning prevents a fallback from touching the clipboard.
+        assert!(received.recv_timeout(std::time::Duration::from_secs(2)).is_ok(), "text path waited for Portal/clipboard");
+        drop(binding);
+        worker.join().unwrap();
+        let keys = crate::uinput::Devices::recorded_events_for_test(&mut keyboard);
+        let down = keys.iter().filter(|e| e.0 == 1 && e.2 == 1).count();
+        let up = keys.iter().filter(|e| e.0 == 1 && e.2 == 0).count();
+        assert!(down >= fixture.len());
+        assert_eq!(down, up);
+        assert_eq!(input.portal_input_counts_for_test(), [0; 3]);
+    }
+
+    #[test]
+    fn full_uinput_bypasses_portal_binding_and_preserves_move_click_order() {
+        for controller in [Controller::Other, Controller::Mobile, Controller::Ios] {
+            let (devices, mut keyboard, mut pointer) = crate::uinput::Devices::recording_for_test();
+            let mut input = InputInjector::without_desktop();
+            input.uinput = Some(devices);
+            input.uinput_pointer = true;
+            let input = std::sync::Arc::new(input);
+            // A blocked Portal must not stall any kernel-routed input. The recording
+            // files exercise the real event writer without typing or clicking on the desktop.
+            let binding = input.portal.lock().unwrap();
+            let worker_input = input.clone();
+            let (done, received) = std::sync::mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                worker_input.set_controller(controller);
+                assert_eq!(worker_input.touch.lock().unwrap().mode, TouchMode::Mouse);
+                worker_input.windows_key_event(65, true);
+                worker_input.windows_key_event(65, false);
+                worker_input.mouse_absolute_normalized(1.0, 0.0, (3072, 1920));
+                worker_input.wire_mouse_button(1, true);
+                worker_input.wire_mouse_button(1, false);
+                worker_input.mouse_scroll(120, 240);
+                worker_input.flush_pointer();
+                let _ = done.send(());
+            });
+            let completed = received.recv_timeout(std::time::Duration::from_secs(1));
+            drop(binding);
+            worker.join().unwrap();
+            assert!(completed.is_ok(), "kernel input waited for a Portal binding");
+            assert_eq!(input.portal_input_counts_for_test(), [0; 3]);
+            let keys = crate::uinput::Devices::recorded_events_for_test(&mut keyboard);
+            assert_eq!(keys, [(1, 30, 1), (0, 0, 0), (1, 30, 0), (0, 0, 0)]);
+            let mouse = crate::uinput::Devices::recorded_events_for_test(&mut pointer);
+            assert_eq!(&mouse[..7], &[
+                (3, 0, 65535), (3, 1, 0), (0, 0, 0),
+                (1, 0x110, 1), (0, 0, 0), (1, 0x110, 0), (0, 0, 0),
+            ]);
+            assert_eq!(mouse.iter().filter(|e| e.0 == 2 && e.1 == 8).map(|e| e.2).sum::<i32>(), 2);
+            assert_eq!(mouse.iter().filter(|e| e.0 == 2 && e.1 == 6).map(|e| e.2).sum::<i32>(), 1);
+        }
+    }
+
+    #[test]
+    fn full_uinput_clamps_coordinates_and_keeps_relative_motion_on_kernel() {
+        let (devices, mut keyboard, mut pointer) = crate::uinput::Devices::recording_for_test();
+        let mut input = InputInjector::without_desktop();
+        input.uinput = Some(devices); input.uinput_pointer = true;
+        *input.screen.lock().unwrap() = (3072, 1920);
+        assert_eq!(input.inject_move(-5, 4000, false), 0);
+        assert_eq!(crate::uinput::Devices::recorded_events_for_test(&mut pointer),
+            [(3, 0, 0), (3, 1, 65535), (0, 0, 0)]);
+        assert_eq!(input.inject_move(4, -3, true), 0);
+        assert_eq!(crate::uinput::Devices::recorded_events_for_test(&mut keyboard),
+            [(2, 0, 4), (2, 1, -3), (0, 0, 0)]);
+        assert_eq!(input.portal_input_counts_for_test(), [0; 3]);
+    }
+
+    #[test]
+    fn kde_output_count_ignores_disabled_and_disconnected_outputs() {
+        assert_eq!(active_output_count(br#"{"outputs":[{"enabled":true,"connected":true},{"enabled":false,"connected":true}]}"#), Some(1));
+        assert_eq!(active_output_count(br#"{"outputs":[{"enabled":true,"connected":true},{"enabled":true,"connected":true}]}"#), Some(2));
+        assert_eq!(active_output_count(br#"{"outputs":[{"enabled":true,"connected":false}]}"#), Some(0));
+        assert_eq!(active_output_count(br#"{}"#), None);
+        assert_eq!(active_output_count(b"invalid"), None);
     }
 }
 
@@ -807,15 +1285,18 @@ impl Drop for DesktopInputSession {fn drop(&mut self) {self.disconnected();}}
 
 #[cfg(test)]
 impl InputInjector {
+    pub fn portal_input_counts_for_test(&self) -> [usize; 3] {
+        std::array::from_fn(|i| self.portal_outcomes[i].load(std::sync::atomic::Ordering::Relaxed))
+    }
     pub fn without_desktop() -> Self {
         Self { mac_controller:std::sync::atomic::AtomicBool::new(false),
             cmd:std::sync::Mutex::new(CmdState::default()), serial:std::sync::Mutex::new(()),
             owner:std::sync::Mutex::new(DesktopOwner::default()), shortcuts:std::sync::Mutex::new(Shortcuts::default()),
-            uinput:None, screen:std::sync::Mutex::new((0,0)), portal_failures:std::sync::atomic::AtomicUsize::new(0),
+            uinput:None, uinput_pointer:false, screen:std::sync::Mutex::new((0,0)), portal_failures:std::sync::atomic::AtomicUsize::new(0),
             portal_outcomes:std::array::from_fn(|_|std::sync::atomic::AtomicUsize::new(0)),
             portal:std::sync::Mutex::new(None), backend:crate::desktop_backend::DesktopBackend::Portal,
             pending:std::sync::Mutex::new(PendingPointer::default()), held:std::sync::Mutex::new(HeldInput::default()),
-            touch:std::sync::Mutex::new(TouchDrag::default()) }
+            touch:std::sync::Mutex::new(TouchDrag::default()), pointer_wake: tokio::sync::Notify::new() }
     }
 }
 
@@ -834,6 +1315,9 @@ fn first_source_types_ascii(sources: &str) -> bool {
     let (base, variant)=layout.split_once('+').unwrap_or((layout, ""));
     const NON_LATIN: &[&str]=&["af","am","ara","bd","bg","bt","by","eg","et","ge","gr","il","in","iq","ir","kg","kh","kz","la","lk","mk","mm","mn","mv","np","ru","sy","th","tj","ua"];
     kind=="xkb" && !NON_LATIN.contains(&base) && !variant.contains("cyrillic") && (base!="rs" || variant.contains("latin"))
+}
+fn uinput_layout_types_ascii(desktop: &str, gnome_layout: impl FnOnce() -> bool) -> bool {
+    !desktop.split(':').any(|name| name.eq_ignore_ascii_case("gnome")) || gnome_layout()
 }
 /// GNOME's active input source is the first of `mru-sources` (else of `sources`). Cached for 2 s.
 fn gnome_layout_types_ascii() -> bool {
@@ -856,6 +1340,17 @@ fn gnome_layout_types_ascii() -> bool {
 #[cfg(test)]
 mod text_keysym_tests {
     use super::*;
+    #[test]
+    fn uinput_preserves_gnome_input_source_guard_without_gating_other_desktops() {
+        for desktop in ["GNOME", "ubuntu:GNOME", "gnome:GNOME-Classic"] {
+            assert!(!uinput_layout_types_ascii(desktop, || first_source_types_ascii("[('ibus', 'libpinyin'), ('xkb', 'us')]")));
+            assert!(!uinput_layout_types_ascii(desktop, || false));
+            assert!(uinput_layout_types_ascii(desktop, || first_source_types_ascii("[('xkb', 'us'), ('ibus', 'libpinyin')]")));
+        }
+        for desktop in ["KDE", "Hyprland", ""] {
+            assert!(uinput_layout_types_ascii(desktop, || panic!("GNOME input-source state must not gate another desktop")));
+        }
+    }
     #[test]
     fn ascii_text_becomes_keysyms_and_other_text_does_not() {
         assert_eq!(ascii_keysyms("Hi!\n\t~"), Some(vec![0x48,0x69,0x21,0xff0d,0xff09,0x7e]));
@@ -883,10 +1378,17 @@ mod touch_tests {
     fn controller_from_platform_numbers_and_mac_strings() {
         use serde_json::json;
         assert_eq!(Controller::from_platform(Some(&json!(2))), Controller::Mobile);
-        assert_eq!(Controller::from_platform(Some(&json!("3"))), Controller::Mobile);
+        assert_eq!(Controller::from_platform(Some(&json!("3"))), Controller::Ios);
+        assert_eq!(Controller::from_platform(Some(&json!("ios"))), Controller::Ios);
+        assert_eq!(Controller::from_platform(Some(&json!("Android"))), Controller::Mobile);
+        assert_eq!(Controller::from_platform(Some(&json!("iPadOS"))), Controller::Ios);
+        assert!(Controller::Ios.is_mobile());
+        assert!(Controller::Mobile.is_mobile());
+        assert!(!Controller::Mac.is_mobile());
         assert_eq!(Controller::from_platform(Some(&json!(4))), Controller::Mac);
         assert_eq!(Controller::from_platform(Some(&json!("MacOS"))), Controller::Mac);
-        assert_eq!(Controller::from_platform(Some(&json!(1))), Controller::Other);
+        assert_eq!(Controller::from_platform(Some(&json!(1))), Controller::Windows);
+        assert_eq!(Controller::from_platform(Some(&json!("Windows"))), Controller::Windows);
         assert_eq!(Controller::from_platform(None), Controller::Other);
     }
     #[test]

@@ -1,15 +1,22 @@
 fn main() {
+    println!("cargo:rerun-if-changed=c_engine/dmabuf_frame.h");
     println!("cargo:rerun-if-changed=c_engine/wayland_transform.h");
     println!("cargo:rerun-if-changed=c_engine/portal_clipboard.inc");
     println!("cargo:rerun-if-changed=c_engine/x11_engine.c");
+    println!("cargo:rerun-if-changed=c_engine/annotation_overlay.c");
+    println!("cargo:rerun-if-changed=c_engine/uinput_keymap.c");
+    println!("cargo:rerun-if-changed=c_engine/uinput_keymap.h");
     println!("cargo:rerun-if-changed=c_engine/nvenc_engine.c");
     println!("cargo:rerun-if-changed=c_engine/nvenc_engine.h");
     println!("cargo:rerun-if-changed=vendor/ffnvcodec/ffnvcodec/dynlink_cuda.h");
     println!("cargo:rerun-if-changed=vendor/ffnvcodec/ffnvcodec/nvEncodeAPI.h");
     println!("cargo:rerun-if-changed=c_engine/clipboard.c");
     println!("cargo:rerun-if-changed=c_engine/assist_window.c");
+    println!("cargo:rerun-if-changed=c_engine/privacy_wallpaper.c");
     println!("cargo:rerun-if-changed=c_engine/viewer_window.c");
     println!("cargo:rerun-if-changed=c_engine/viewer_tools.c");
+    println!("cargo:rerun-if-changed=c_engine/ui_theme.c");
+    println!("cargo:rerun-if-changed=c_engine/ui_theme.h");
     println!("cargo:rerun-if-changed=c_engine/pam_check.c");
     println!("cargo:rerun-if-env-changed=UU_NO_GTK");
     println!("cargo:rustc-check-cfg=cfg(uu_gtk)");
@@ -28,9 +35,17 @@ fn main() {
         }
         let mut x11_build = cc::Build::new();
         x11_build.file("c_engine/x11_engine.c")
+            .file("c_engine/annotation_overlay.c")
+            .file("c_engine/uinput_keymap.c")
             .file("c_engine/clipboard.c")
             .file("c_engine/pam_check.c");
         if std::env::var_os("CARGO_FEATURE_INPROC_AV").is_some() {
+            println!("cargo:rerun-if-changed=c_engine/audio_engine.c");
+            x11_build.file("c_engine/audio_engine.c");
+            let audio_flags = std::process::Command::new("pkg-config").args(["--cflags", "libpulse", "opus"])
+                .output().expect("inproc-av requires libpulse and opus development libraries");
+            assert!(audio_flags.status.success(), "inproc-av requires libpulse-dev and libopus-dev");
+            for flag in String::from_utf8_lossy(&audio_flags.stdout).split_whitespace() { x11_build.flag(flag); }
             x11_build.file("c_engine/nvenc_engine.c");
             x11_build.file("c_engine/vaapi_engine.c");
             x11_build.file("c_engine/dri3_capture.c");
@@ -38,15 +53,22 @@ fn main() {
                 println!("cargo:rerun-if-changed={f}");
             }
             x11_build.include("vendor/ffnvcodec");
-            // libva/libva-drm are dlopen'ed at runtime (like NVENC's libcuda); these are
-            // link-time-only deps of the DRI3/VAAPI engines and must stay out of default builds.
+        }
+        x11_build.compile("x11_engine");
+        // libva/libva-drm are dlopen'ed at runtime (like NVENC's libcuda); these are
+        // link-time-only deps of the DRI3/VAAPI engines and must stay out of default builds.
+        if std::env::var_os("CARGO_FEATURE_INPROC_AV").is_some() {
+            // Emit them after the static C archive: GNU ld --as-needed would otherwise
+            // discard the shared libraries before libx11_engine.a references their symbols.
+            println!("cargo:rustc-link-lib=pulse");
+            println!("cargo:rustc-link-lib=opus");
             println!("cargo:rustc-link-lib=gbm");
             println!("cargo:rustc-link-lib=X11-xcb");
             println!("cargo:rustc-link-lib=xcb");
             println!("cargo:rustc-link-lib=xcb-dri3");
             println!("cargo:rustc-link-lib=xcb-damage");
         }
-        x11_build.compile("x11_engine");
+
 
         println!("cargo:rustc-link-lib=X11");
         println!("cargo:rustc-link-lib=Xext");
@@ -59,7 +81,7 @@ fn main() {
         match (std::env::var_os("UU_NO_GTK").is_none()).then(|| gtk("--cflags").zip(gtk("--libs"))).flatten() {
             Some((cflags, libs)) => {
                 let mut build = cc::Build::new();
-                build.file("c_engine/assist_window.c").file("c_engine/viewer_window.c").file("c_engine/viewer_tools.c").flag_if_supported("-Wno-deprecated-declarations");
+                build.file("c_engine/assist_window.c").file("c_engine/privacy_wallpaper.c").file("c_engine/viewer_window.c").file("c_engine/viewer_tools.c").file("c_engine/ui_theme.c").flag_if_supported("-Wno-deprecated-declarations");
                 for flag in cflags.split_whitespace() { build.flag(flag); }
                 build.compile("uu_login_window");
                 for flag in libs.split_whitespace() {
@@ -151,6 +173,11 @@ fn shared_engine(name: &str, sources: &[&str], includes: &[&std::path::Path], cf
     command.args(cflags.split_whitespace()).args(sources).args(libs.split_whitespace()).arg("-lpthread");
     let status = command.status().expect("C compiler for the engine plugin");
     assert!(status.success(), "building {name} failed");
-    // OUT_DIR = target/<profile>/build/<package>-<hash>/out
-    if let Some(profile) = out.ancestors().nth(3) { std::fs::copy(&library, profile.join(name)).expect("copy engine plugin"); }
+    // OUT_DIR = target/<profile>/build/<package>-<hash>/out, or target/<profile>/build/<package>/<hash>/out with
+    // the newer Cargo build-dir layout (Rust 1.100 CI): the profile dir is the parent of the `build` component.
+    let profile = out.ancestors().find(|dir| dir.file_name().is_some_and(|n| n == "build")).and_then(|dir| dir.parent());
+    match profile {
+        Some(profile) => { std::fs::copy(&library, profile.join(name)).expect("copy engine plugin"); }
+        None => println!("cargo:warning={name} built in {} but no target/<profile> dir found to copy it to", out.display()),
+    }
 }

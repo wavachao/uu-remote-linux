@@ -16,6 +16,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <limits.h>
 
 #define DEST "org.freedesktop.portal.Desktop"
 #define PATH "/org/freedesktop/portal/desktop"
@@ -37,7 +38,8 @@ struct uu_portal {
     char *session;
     char *restore_token;
     guint closed_subscription, clipboard_owner_subscription, clipboard_transfer_subscription, display_subscription;
-    int clipboard_enabled, clipboard_changed;
+    int clipboard_enabled, clipboard_changed, clipboard_owns;
+    int cursor_available, cursor_applied;
     char *clipboard_text, *clipboard_mime;
     size_t clipboard_length;
     uint64_t clipboard_revision;
@@ -71,11 +73,23 @@ struct uu_portal {
     size_t frame_length;
     uint64_t sequence;
     uint64_t revision;
+    uint32_t buffers_seen, last_buffer_type;
+    int dma_requested, dma_negotiated, dma_format, dma_bad, dma_blocked, dma_neutral, dma_seen;
+    uint64_t modifier;
+    gint64 dma_requested_at;
+    struct pw_buffer *dma_pending, *dma_current;
 };
 #include "portal_clipboard.inc"
 
 static pthread_once_t pw_once = PTHREAD_ONCE_INIT;
 static atomic_uint token_sequence = 1;
+/* Cursor preference for sessions opened from now on; -1 defers to UU_PORTAL_CURSOR_MODE. */
+static atomic_int cursor_mode_override = -1;
+void uu_portal_set_cursor_mode(int mode) { atomic_store(&cursor_mode_override, mode); }
+/* Cursor mode the last session actually requested: 1 hidden, 2 embedded, 0 when unavailable. */
+int uu_portal_cursor_mode(struct uu_portal *p) { return p ? p->cursor_applied : 0; }
+/* Cursor modes the backend advertised for the last session; 0 when the property was unreadable. */
+int uu_portal_cursor_modes(struct uu_portal *p) { return p ? p->cursor_available : 0; }
 static void initialize_pipewire(void) { pw_init(NULL, NULL); }
 static GVariant *empty_options(void) { return g_variant_new_array(G_VARIANT_TYPE("{sv}"), NULL, 0); }
 static int open_cancelled(struct uu_portal *p) {
@@ -83,10 +97,10 @@ static int open_cancelled(struct uu_portal *p) {
 }
 static int wait_for_first_frame(struct uu_portal *p);
 #include "portal_eis.inc"
-/* A uint32 RemoteDesktop property (version, AvailableDeviceTypes); 0 when unreadable. */
-static guint remote_property(struct uu_portal *p, const char *name) {
+/* A uint32 portal property; 0 when unreadable. */
+static guint interface_property(struct uu_portal *p, const char *interface, const char *name) {
     GVariant *reply = g_dbus_connection_call_sync(p->bus, DEST, PATH,
-        "org.freedesktop.DBus.Properties", "Get", g_variant_new("(ss)", REMOTE, name),
+        "org.freedesktop.DBus.Properties", "Get", g_variant_new("(ss)", interface, name),
         G_VARIANT_TYPE("(v)"), G_DBUS_CALL_FLAGS_NONE, 3000, NULL, NULL);
     guint result = 0;
     if (reply) {
@@ -95,6 +109,10 @@ static guint remote_property(struct uu_portal *p, const char *name) {
         g_variant_unref(value); g_variant_unref(reply);
     }
     return result;
+}
+/* A uint32 RemoteDesktop property (version, AvailableDeviceTypes). */
+static guint remote_property(struct uu_portal *p, const char *name) {
+    return interface_property(p, REMOTE, name);
 }
 static void fail(struct uu_portal *p, int error) {
     pthread_mutex_lock(&p->lock);
@@ -173,6 +191,8 @@ static void session_closed(GDBusConnection *bus, const gchar *sender, const gcha
     const gchar *interface, const gchar *signal, GVariant *parameters, gpointer data) {
     (void)bus; (void)sender; (void)path; (void)interface; (void)signal; (void)parameters;
     struct uu_portal *p = data;
+    /* A closed session no longer tracks owner changes, so its cached claim is stale. */
+    pthread_mutex_lock(&p->lock); p->clipboard_owns=0; pthread_mutex_unlock(&p->lock);
     atomic_store(&p->closed, 1); fail(p, 9);
 }
 static void *run_dbus(void *data) {
@@ -223,11 +243,17 @@ static void stream_state(void *data, enum pw_stream_state old, enum pw_stream_st
     pthread_mutex_unlock(&p->lock);
     if (state == PW_STREAM_STATE_ERROR || state == PW_STREAM_STATE_UNCONNECTED) fail(data, 9);
 }
+static void return_dma_buffer(struct uu_portal *p, struct pw_buffer **buffer);
 static void stream_format(void *data, uint32_t id, const struct spa_pod *param) {
     struct uu_portal *p = data;
     if (id != SPA_PARAM_Format) return;
     if (!param) {
         pthread_mutex_lock(&p->lock);
+        if (p->dma_format) {
+            return_dma_buffer(p, &p->dma_pending);
+            return_dma_buffer(p, &p->dma_current);
+            p->sequence = 0;
+        }
         p->format_valid = 0;
         update_interruption(p);
         pthread_mutex_unlock(&p->lock);
@@ -239,6 +265,11 @@ static void stream_format(void *data, uint32_t id, const struct spa_pod *param) 
         (info.format != SPA_VIDEO_FORMAT_BGRA && info.format != SPA_VIDEO_FORMAT_BGRx &&
          info.format != SPA_VIDEO_FORMAT_RGBA && info.format != SPA_VIDEO_FORMAT_RGBx)) { fail(p, 8); return; }
     pthread_mutex_lock(&p->lock);
+    if (p->dma_format) {
+        return_dma_buffer(p, &p->dma_pending);
+        return_dma_buffer(p, &p->dma_current);
+        p->sequence = 0;
+    }
     if (p->width && (p->width != info.size.width || p->height != info.size.height)) {
         p->error = 8; pthread_cond_broadcast(&p->changed); pthread_mutex_unlock(&p->lock); return;
     }
@@ -246,12 +277,70 @@ static void stream_format(void *data, uint32_t id, const struct spa_pod *param) 
     if (!p->frame) p->frame = malloc(length);
     if (!p->frame) { p->error = 8; pthread_mutex_unlock(&p->lock); return; }
     p->width = info.size.width; p->height = info.size.height; p->format = info.format;
+    p->dma_format = spa_pod_find_prop(param, NULL, SPA_FORMAT_VIDEO_modifier) != NULL;
+    p->modifier = info.modifier;
+    p->dma_negotiated = p->dma_requested;
+    p->buffers_seen = 0;
     p->frame_length = length;
     p->format_valid = 1;
     p->display_changed_at = 0;
     update_interruption(p);
     pthread_cond_broadcast(&p->changed);
     pthread_mutex_unlock(&p->lock);
+    fprintf(stderr, "Portal capture format: format=%u size=%ux%u dma_buf=%d dma_requested=%d modifier=%llu\n",
+        info.format, info.size.width, info.size.height, p->dma_format, p->dma_requested, (unsigned long long)info.modifier);
+    /* PipeWire DMA-BUF sharing: modifier formats require DMA buffers exclusively.
+     * Keep a current and a pending frame; at least four buffers prevent producer starvation. */
+    if (p->stream) {
+        uint8_t storage[256];
+        struct spa_pod_builder builder = SPA_POD_BUILDER_INIT(storage, sizeof(storage));
+        const struct spa_pod *buffers = spa_pod_builder_add_object(&builder, SPA_TYPE_OBJECT_ParamBuffers, SPA_PARAM_Buffers,
+            SPA_PARAM_BUFFERS_buffers, SPA_POD_CHOICE_RANGE_Int(4, 4, 8),
+            SPA_PARAM_BUFFERS_dataType, SPA_POD_CHOICE_FLAGS_Int(p->dma_format ?
+                (1 << SPA_DATA_DmaBuf) : ((1 << SPA_DATA_MemPtr) | (1 << SPA_DATA_MemFd))));
+        pw_stream_update_params(p->stream, &buffers, 1);
+    }
+}
+
+/* All pending/current buffer changes run under the PipeWire loop lock, then p->lock. */
+static void return_dma_buffer(struct uu_portal *p, struct pw_buffer **buffer) {
+    if (*buffer && p->stream) pw_stream_queue_buffer(p->stream, *buffer);
+    *buffer = NULL;
+}
+static int describe_dma_buffer(struct uu_portal *p, struct spa_buffer *spa, UuDmaFrame *frame) {
+    if (p->error || atomic_load(&p->closed)) return 10;
+    if (p->modifier != 0) return 19;
+    if (!p->format_valid || !p->width || !p->height || spa->n_datas != 1) return 14;
+    struct spa_data *d = &spa->datas[0];
+    struct spa_meta_header *header = spa_buffer_find_meta_data(spa, SPA_META_Header, sizeof(*header));
+    if (!d->chunk || (d->chunk->flags & SPA_CHUNK_FLAG_CORRUPTED) ||
+        (header && (header->flags & SPA_META_HEADER_FLAG_CORRUPTED))) return 10;
+    if (d->chunk->flags & SPA_CHUNK_FLAG_EMPTY) return 15;
+    struct spa_meta_region *crop = spa_buffer_find_meta_data(spa, SPA_META_VideoCrop, sizeof(*crop));
+    if (crop && spa_meta_region_is_valid(crop) && (crop->region.position.x || crop->region.position.y ||
+        crop->region.size.width != p->width || crop->region.size.height != p->height)) return 14;
+    /* Explicit sync is not advertised; require implicit DMA-BUF fences understood by VAAPI. */
+#if PW_CHECK_VERSION(1, 2, 0)
+    if (spa_buffer_find_meta(spa, SPA_META_SyncTimeline)) return 18;
+#endif
+    if (d->type != SPA_DATA_DmaBuf || d->fd < 0 || d->fd > INT_MAX || d->chunk->stride < (int64_t)p->width * 4)
+        return 14;
+    uint64_t offset = (uint64_t)d->mapoffset + d->chunk->offset;
+    uint64_t size = (uint64_t)d->mapoffset + d->maxsize;
+    uint64_t required = offset + (uint64_t)(p->height - 1) * d->chunk->stride + (uint64_t)p->width * 4;
+    if (required > size || size > UINT32_MAX) return 14;
+    if (required - offset > d->chunk->size) return 10;
+    uint32_t fourcc;
+    switch (p->format) {
+        case SPA_VIDEO_FORMAT_BGRx: fourcc=0x34325258; break;
+        case SPA_VIDEO_FORMAT_BGRA: fourcc=0x34325241; break;
+        case SPA_VIDEO_FORMAT_RGBx: fourcc=0x34324258; break;
+        case SPA_VIDEO_FORMAT_RGBA: fourcc=0x34324241; break;
+        default: return 14;
+    }
+    *frame = (UuDmaFrame){ .fd=d->fd, .fourcc=fourcc, .width=p->width, .height=p->height,
+        .stride=d->chunk->stride, .offset=offset, .size=size, .modifier=p->modifier };
+    return 0;
 }
 /* Called with the frame mutex held. Invalid transient chunks are discarded;
  * allocation capacity is not evidence that valid pixels have been supplied. */
@@ -301,14 +390,131 @@ static void stream_process(void *data) {
     }
     if (!newest) return;
     pthread_mutex_lock(&p->lock);
-    copy_video_buffer(p, newest->buffer);
+    p->buffers_seen++;
+    p->last_buffer_type = newest->buffer->n_datas ? newest->buffer->datas[0].type : 0;
+    if (p->dma_format) {
+        UuDmaFrame frame;
+        int result = describe_dma_buffer(p, newest->buffer, &frame);
+        if (result == 0 && p->dma_requested && !p->dma_blocked) {
+            return_dma_buffer(p, &p->dma_pending);
+            p->dma_pending = newest;
+            newest = NULL;
+            p->dma_seen = 1;
+            p->sequence++; p->revision++; p->dma_neutral = 0;
+        } else if (result == 15) {
+            return_dma_buffer(p, &p->dma_pending);
+            return_dma_buffer(p, &p->dma_current);
+            p->dma_neutral = 1; p->sequence++; p->revision++;
+        } else if (result != 10) p->dma_bad = result;
+    } else copy_video_buffer(p, newest->buffer);
     pthread_cond_broadcast(&p->changed);
     pthread_mutex_unlock(&p->lock);
-    pw_stream_queue_buffer(p->stream, newest);
+    if (newest) pw_stream_queue_buffer(p->stream, newest);
+}
+static void stream_remove_buffer(void *data, struct pw_buffer *buffer) {
+    struct uu_portal *p = data;
+    pthread_mutex_lock(&p->lock);
+    if (p->dma_pending == buffer) p->dma_pending = NULL;
+    if (p->dma_current == buffer) p->dma_current = NULL;
+    pthread_mutex_unlock(&p->lock);
 }
 static const struct pw_stream_events stream_events = {
-    PW_VERSION_STREAM_EVENTS, .state_changed = stream_state, .param_changed = stream_format, .process = stream_process
+    PW_VERSION_STREAM_EVENTS, .state_changed = stream_state, .param_changed = stream_format, .process = stream_process,
+    .remove_buffer = stream_remove_buffer
 };
+
+static unsigned capture_formats(struct uu_portal *p, struct spa_pod_builder *b, const struct spa_pod **params, int dma) {
+    unsigned count = 0;
+    /* Only advertise linear RGB: arbitrary tiling/compression cannot be inferred from an FD.
+     * PipeWire page_dma_buf: put the modifier format before the shared-memory fallback. */
+    for (int with_modifier = dma; with_modifier >= 0; with_modifier--) {
+        struct spa_pod_frame frame;
+        spa_pod_builder_push_object(b, &frame, SPA_TYPE_OBJECT_Format, SPA_PARAM_EnumFormat);
+        spa_pod_builder_add(b,
+            SPA_FORMAT_mediaType, SPA_POD_Id(SPA_MEDIA_TYPE_video),
+            SPA_FORMAT_mediaSubtype, SPA_POD_Id(SPA_MEDIA_SUBTYPE_raw),
+            SPA_FORMAT_VIDEO_format, SPA_POD_CHOICE_ENUM_Id(4, SPA_VIDEO_FORMAT_BGRA, SPA_VIDEO_FORMAT_BGRx, SPA_VIDEO_FORMAT_RGBA, SPA_VIDEO_FORMAT_RGBx),
+            0);
+        if (p->width && p->height) spa_pod_builder_add(b,
+            SPA_FORMAT_VIDEO_size, SPA_POD_Rectangle(&SPA_RECTANGLE(p->width,p->height)), 0);
+        else spa_pod_builder_add(b, SPA_FORMAT_VIDEO_size,
+            SPA_POD_CHOICE_RANGE_Rectangle(&SPA_RECTANGLE(1920,1080), &SPA_RECTANGLE(1,1), &SPA_RECTANGLE(8192,8192)), 0);
+        spa_pod_builder_add(b,
+            SPA_FORMAT_VIDEO_framerate, SPA_POD_CHOICE_RANGE_Fraction(&SPA_FRACTION(60,1), &SPA_FRACTION(0,1), &SPA_FRACTION(60,1)), 0);
+        if (with_modifier) {
+            spa_pod_builder_prop(b, SPA_FORMAT_VIDEO_modifier, SPA_POD_PROP_FLAG_MANDATORY);
+            spa_pod_builder_long(b, 0); /* DRM_FORMAT_MOD_LINEAR */
+        }
+        params[count++] = spa_pod_builder_pop(b, &frame);
+    }
+    params[count++] = spa_pod_builder_add_object(b, SPA_TYPE_OBJECT_ParamBuffers, SPA_PARAM_Buffers,
+        SPA_PARAM_BUFFERS_buffers, SPA_POD_CHOICE_RANGE_Int(4, 4, 8),
+        SPA_PARAM_BUFFERS_dataType, SPA_POD_CHOICE_FLAGS_Int((1 << SPA_DATA_MemPtr) | (1 << SPA_DATA_MemFd) |
+            (dma ? (1 << SPA_DATA_DmaBuf) : 0)));
+    return count;
+}
+static int request_capture_formats(struct uu_portal *p, int dma) {
+    uint8_t storage[2048];
+    struct spa_pod_builder b = SPA_POD_BUILDER_INIT(storage, sizeof(storage));
+    const struct spa_pod *params[3];
+    unsigned count = capture_formats(p, &b, params, dma);
+    return pw_stream_update_params(p->stream, params, count);
+}
+
+int uu_portal_dmabuf_acquire(struct uu_portal *p, UuDmaFrame *frame, uint64_t *revision) {
+    if (!p || !p->pw_loop || !p->stream || !frame || !revision) return 14;
+    pw_thread_loop_lock(p->pw_loop);
+    pthread_mutex_lock(&p->lock);
+    int result = 10;
+    if (atomic_load(&p->closed) || p->error || p->dma_blocked) result = 14;
+    else if (p->dma_bad) result = p->dma_bad;
+    else if (!p->dma_requested) {
+        p->dma_requested = 1; p->dma_negotiated = 0; p->dma_seen = 0;
+        p->dma_requested_at = g_get_monotonic_time();
+        pthread_mutex_unlock(&p->lock);
+        int status = request_capture_formats(p, 1);
+        pw_thread_loop_unlock(p->pw_loop);
+        return status < 0 ? 14 : 10;
+    } else if (p->dma_negotiated && !p->dma_format) result = 16;
+    else if (!p->dma_seen && !p->dma_neutral &&
+        g_get_monotonic_time() - p->dma_requested_at > 2 * G_TIME_SPAN_SECOND) result = 17;
+    else if (p->dma_neutral) result = 15;
+    else if (p->dma_format && p->format_valid) {
+        if (p->dma_pending) {
+            return_dma_buffer(p, &p->dma_current);
+            p->dma_current = p->dma_pending; p->dma_pending = NULL;
+        }
+        if (p->dma_current) {
+            result = describe_dma_buffer(p, p->dma_current->buffer, frame);
+            if (!result) {
+                result = *revision == p->revision ? 12 : 0;
+                *revision = p->revision;
+            }
+        }
+    }
+    pthread_mutex_unlock(&p->lock);
+    /* A lease pins both the pw_buffer and its format across VAAPI's completion fence.
+     * No producer buffer may be returned, removed or renegotiated while the GPU reads it. */
+    if (result != 0 && result != 12) pw_thread_loop_unlock(p->pw_loop);
+    return result;
+}
+void uu_portal_dmabuf_release(struct uu_portal *p) {
+    pw_thread_loop_unlock(p->pw_loop);
+}
+void uu_portal_dmabuf_disable(struct uu_portal *p) {
+    if (!p || !p->pw_loop || !p->stream) return;
+    pw_thread_loop_lock(p->pw_loop);
+    pthread_mutex_lock(&p->lock);
+    int requested = p->dma_requested;
+    if (requested) {
+        p->dma_requested = 0; p->dma_blocked = 1; p->dma_neutral = 0;
+        return_dma_buffer(p, &p->dma_pending); return_dma_buffer(p, &p->dma_current);
+        if (p->dma_format) { p->sequence = 0; p->revision++; }
+    }
+    pthread_mutex_unlock(&p->lock);
+    if (requested) request_capture_formats(p, 0);
+    pw_thread_loop_unlock(p->pw_loop);
+}
 static int connect_pipewire(struct uu_portal *p) {
     if (open_cancelled(p)) return 13;
     GUnixFDList *fds = NULL;
@@ -337,36 +543,45 @@ static int connect_pipewire(struct uu_portal *p) {
         PW_KEY_MEDIA_TYPE, "Video", PW_KEY_MEDIA_CATEGORY, "Capture", PW_KEY_MEDIA_ROLE, "Screen", NULL));
     if (!p->stream) return 7;
     pw_stream_add_listener(p->stream, &p->stream_listener, &stream_events, p);
-    uint8_t storage[1024]; struct spa_pod_builder builder = SPA_POD_BUILDER_INIT(storage, sizeof(storage));
-    const struct spa_pod *params[2];
-    params[0] = spa_pod_builder_add_object(&builder, SPA_TYPE_OBJECT_Format, SPA_PARAM_EnumFormat,
-        SPA_FORMAT_mediaType, SPA_POD_Id(SPA_MEDIA_TYPE_video), SPA_FORMAT_mediaSubtype, SPA_POD_Id(SPA_MEDIA_SUBTYPE_raw),
-        SPA_FORMAT_VIDEO_format, SPA_POD_CHOICE_ENUM_Id(4, SPA_VIDEO_FORMAT_BGRA, SPA_VIDEO_FORMAT_BGRx, SPA_VIDEO_FORMAT_RGBA, SPA_VIDEO_FORMAT_RGBx),
-        SPA_FORMAT_VIDEO_size, SPA_POD_CHOICE_RANGE_Rectangle(&SPA_RECTANGLE(1920,1080), &SPA_RECTANGLE(1,1), &SPA_RECTANGLE(8192,8192)),
-        SPA_FORMAT_VIDEO_framerate, SPA_POD_CHOICE_RANGE_Fraction(&SPA_FRACTION(60,1), &SPA_FRACTION(0,1), &SPA_FRACTION(60,1)));
-    params[1] = spa_pod_builder_add_object(&builder, SPA_TYPE_OBJECT_ParamBuffers, SPA_PARAM_Buffers,
-        SPA_PARAM_BUFFERS_dataType, SPA_POD_CHOICE_FLAGS_Int((1 << SPA_DATA_MemPtr) | (1 << SPA_DATA_MemFd)));
+    uint8_t storage[2048]; struct spa_pod_builder builder = SPA_POD_BUILDER_INIT(storage, sizeof(storage));
+    const struct spa_pod *params[3];
+    unsigned param_count = capture_formats(p, &builder, params, p->dma_requested);
+    p->dma_requested_at = g_get_monotonic_time();
     /* Node ID belongs to this portal's restricted remote. Do not put it into
      * target.object, whose numeric value means object.serial on modern PW. */
     if (pw_stream_connect(p->stream, PW_DIRECTION_INPUT, p->node,
-        PW_STREAM_FLAG_AUTOCONNECT | PW_STREAM_FLAG_MAP_BUFFERS, params, 2) < 0) return 7;
+        PW_STREAM_FLAG_AUTOCONNECT | PW_STREAM_FLAG_MAP_BUFFERS, params, param_count) < 0) return 7;
     if (pw_thread_loop_start(p->pw_loop) < 0) return 7;
-    return wait_for_first_frame(p);
+    int result = wait_for_first_frame(p);
+    pthread_mutex_lock(&p->lock);
+    int fallback = (result == 10 || result == 14) && p->dma_requested && !p->error &&
+        !atomic_load(&p->closed) && !open_cancelled(p);
+    int dma_status = p->dma_bad;
+    pthread_mutex_unlock(&p->lock);
+    if (fallback) {
+        fprintf(stderr, "Portal initial DMA-BUF unavailable: status=%d; falling back to shared-memory capture\n", dma_status);
+        uu_portal_dmabuf_disable(p);
+        result = wait_for_first_frame(p);
+    }
+    return result;
 }
 static int wait_for_first_frame(struct uu_portal *p) {
     struct timespec until;
     gint64 deadline = g_get_monotonic_time() + 10 * G_TIME_SPAN_SECOND;
     pthread_mutex_lock(&p->lock);
-    while (!p->sequence && !p->error && !open_cancelled(p)) {
+    while (!p->sequence && !p->error && !open_cancelled(p) && !(p->dma_requested && p->dma_bad)) {
         gint64 remaining = deadline - g_get_monotonic_time();
         if (remaining <= 0) break;
-        clock_gettime(CLOCK_REALTIME, &until);
+        clock_gettime(CLOCK_MONOTONIC, &until);
         gint64 wait_us = MIN(100000, remaining);
         until.tv_nsec += wait_us * 1000;
         if (until.tv_nsec >= 1000000000) { until.tv_sec++; until.tv_nsec -= 1000000000; }
         pthread_cond_timedwait(&p->changed, &p->lock, &until);
     }
-    int result = p->error ? p->error : open_cancelled(p) ? 13 : p->sequence ? 0 : 10;
+    int result = p->error ? p->error : open_cancelled(p) ? 13 : p->sequence ? 0 :
+        p->dma_requested && p->dma_bad ? 14 : 10;
+    if (result == 10) fprintf(stderr, "Portal first-frame timeout: format_valid=%d dma_buf=%d dma_requested=%d buffers=%u last_type=%u dma_status=%d\n",
+        p->format_valid, p->dma_format, p->dma_requested, p->buffers_seen, p->last_buffer_type, p->dma_bad);
     pthread_mutex_unlock(&p->lock);
     return result;
 }
@@ -393,14 +608,21 @@ static int read_stream_result(struct uu_portal *p, GVariant *results) {
     if (streams) g_variant_unref(streams);
     return error;
 }
+static void save_restore_token(struct uu_portal *p, void (*save_token)(const char *, void *),
+    uu_portal_save_detailed_fn save_detailed, void *save_data) {
+    if (!p->restore_token) return;
+    if (save_token) save_token(p->restore_token, save_data);
+    if (save_detailed) save_detailed(p->restore_token, save_data, p->has_position, p->position_x, p->position_y);
+}
 static struct uu_portal *open_persist(const char *restore, void (*save_token)(const char *, void *),
-    void *save_data, uu_portal_cancelled_fn cancelled, void *cancel_data,
-    int *error, uint32_t *width, uint32_t *height) {
+    uu_portal_save_detailed_fn save_detailed, void *save_data, uu_portal_cancelled_fn cancelled, void *cancel_data,
+    int prefer_dmabuf, int *error, uint32_t *width, uint32_t *height, uint32_t source_types) {
     *error = 0; *width = *height = 0;
     struct uu_portal *p = calloc(1, sizeof(*p));
     if (!p) { *error = 8; return NULL; }
     p->cancelled = cancelled;
     p->cancel_data = cancel_data;
+    p->dma_requested = !!prefer_dmabuf;
     /* GNOME forwards NotifyPointerMotionAbsolute into Mutter's stream-to-stage
      * transform. It expects stream pixels, unlike the compositor-sized KDE path.
      * Do not apply the compositor scale twice on fractional-scale displays. */
@@ -408,7 +630,12 @@ static struct uu_portal *open_persist(const char *restore, void (*save_token)(co
     for (gchar **desktop = desktops; *desktop; desktop++)
         if (!g_ascii_strcasecmp(*desktop, "GNOME")) p->absolute_stream_pixels = 1;
     g_strfreev(desktops);
-    pthread_mutex_init(&p->lock, NULL); pthread_cond_init(&p->changed, NULL);
+    pthread_mutex_init(&p->lock, NULL);
+    pthread_condattr_t cond_attr;
+    pthread_condattr_init(&cond_attr);
+    pthread_condattr_setclock(&cond_attr, CLOCK_MONOTONIC);
+    pthread_cond_init(&p->changed, &cond_attr);
+    pthread_condattr_destroy(&cond_attr);
     p->context = g_main_context_new(); g_main_context_push_thread_default(p->context);
     p->bus = g_bus_get_sync(G_BUS_TYPE_SESSION, NULL, NULL);
     if (!p->bus) { *error = 1; goto done; }
@@ -442,9 +669,26 @@ static struct uu_portal *open_persist(const char *restore, void (*save_token)(co
     if (!results) goto done;
     g_variant_unref(results);
     g_variant_builder_init(&options, G_VARIANT_TYPE_VARDICT);
-    g_variant_builder_add(&options, "{sv}", "types", g_variant_new_uint32(1));
+    /* 1 monitor; 4 virtual (KDE creates a KWin virtual output for the stream). */
+    g_variant_builder_add(&options, "{sv}", "types", g_variant_new_uint32(source_types));
     g_variant_builder_add(&options, "{sv}", "multiple", g_variant_new_boolean(FALSE));
-    /* Hidden cursor avoids duplicate pointer; supported since ScreenCast v1. */
+    /* Hidden cursor avoids a duplicate pointer in absolute mode: the viewer draws its own where
+     * it last sent motion. Relative mode has no such position, so the game's cursor has to come
+     * from the compositor. The host flips this at runtime through uu_portal_set_cursor_mode();
+     * UU_PORTAL_CURSOR_MODE=embedded is the startup default. Only sent when the backend
+     * advertises embedded, since an unsupported value closes the session. */
+    int cursor_mode = atomic_load(&cursor_mode_override);
+    if (cursor_mode < 0) {
+        const char *wanted = g_getenv("UU_PORTAL_CURSOR_MODE");
+        cursor_mode = (wanted && !g_ascii_strcasecmp(wanted, "embedded")) ? 2 : 1;
+    }
+    /* The host reads these back so its belief matches what the session actually requested. */
+    p->cursor_available = (int)interface_property(p, SCREEN, "AvailableCursorModes");
+    p->cursor_applied = 1;
+    if (cursor_mode == 2 && (p->cursor_available & 2)) {
+        g_variant_builder_add(&options, "{sv}", "cursor_mode", g_variant_new_uint32(2));
+        p->cursor_applied = 2;
+    }
     results = request(p, SCREEN, "SelectSources", &options, 1, error);
     if (!results) goto done;
     g_variant_unref(results);
@@ -472,7 +716,7 @@ static struct uu_portal *open_persist(const char *restore, void (*save_token)(co
         fprintf(stderr, "Portal persistence: requested=%d restore_attempted=%d token_returned=%d\n",
             version >= 2, restore && *restore, p->restore_token && *p->restore_token);
     }
-    if (!*error && p->restore_token && save_token) save_token(p->restore_token, save_data);
+    if (!*error) save_restore_token(p, save_token, save_detailed, save_data);
     g_variant_unref(results);
     if (*error) goto done;
     p->main_loop = g_main_loop_new(p->context, FALSE);
@@ -505,11 +749,27 @@ struct uu_portal *uu_portal_open_persist_cancellable(const char *restore,
     void (*save_token)(const char *, void *), void *save_data,
     uu_portal_cancelled_fn cancelled, void *cancel_data,
     int *error, uint32_t *width, uint32_t *height) {
-    return open_persist(restore, save_token, save_data, cancelled, cancel_data, error, width, height);
+    return open_persist(restore, save_token, NULL, save_data, cancelled, cancel_data, 0, error, width, height, 1);
+}
+struct uu_portal *uu_portal_open_persist_capture(const char *restore,
+    void (*save_token)(const char *, void *), void *save_data,
+    uu_portal_cancelled_fn cancelled, void *cancel_data, int prefer_dmabuf,
+    int *error, uint32_t *width, uint32_t *height) {
+    return open_persist(restore, save_token, NULL, save_data, cancelled, cancel_data, prefer_dmabuf, error, width, height, 1);
 }
 struct uu_portal *uu_portal_open_persist(const char *restore, void (*save_token)(const char *, void *),
     void *data, int *error, uint32_t *width, uint32_t *height) {
-    return open_persist(restore, save_token, data, NULL, NULL, error, width, height);
+    return open_persist(restore, save_token, NULL, data, NULL, NULL, 0, error, width, height, 1);
+}
+struct uu_portal *uu_portal_open_virtual(const char *restore, void (*save_token)(const char *, void *),
+    void *data, int *error, uint32_t *width, uint32_t *height) {
+    return open_persist(restore, save_token, NULL, data, NULL, NULL, 0, error, width, height, 4);
+}
+struct uu_portal *uu_portal_open_detailed(const char *restore, uu_portal_save_detailed_fn save_token,
+    void *save_data, uu_portal_cancelled_fn cancelled, void *cancel_data, int prefer_dmabuf,
+    uint32_t source_types, int *error, uint32_t *width, uint32_t *height) {
+    if (source_types != 1 && source_types != 4) { *error = 3; *width = *height = 0; return NULL; }
+    return open_persist(restore, NULL, save_token, save_data, cancelled, cancel_data, prefer_dmabuf, error, width, height, source_types);
 }
 struct uu_portal *uu_portal_open_restore(const char *restore, int *error, uint32_t *width, uint32_t *height) {
     return uu_portal_open_persist(restore, NULL, NULL, error, width, height);
@@ -556,11 +816,15 @@ void uu_portal_close(struct uu_portal *p) {
 }
 void uu_portal_reset_frame(struct uu_portal *p) {
     if (!p) return;
+    if (p->pw_loop) pw_thread_loop_lock(p->pw_loop);
     pthread_mutex_lock(&p->lock);
+    return_dma_buffer(p, &p->dma_pending); return_dma_buffer(p, &p->dma_current);
+    p->dma_neutral = 0;
     p->sequence = 0;
     p->revision++;
     if (p->frame) memset(p->frame, 0, p->frame_length);
     pthread_mutex_unlock(&p->lock);
+    if (p->pw_loop) pw_thread_loop_unlock(p->pw_loop);
 }
 int uu_portal_capture(struct uu_portal *p, uint8_t *frame, size_t length) {
     return uu_portal_capture_since(p, frame, length, NULL);
@@ -577,6 +841,7 @@ static int stream_stalled(struct uu_portal *p) {
 }
 int uu_portal_capture_since(struct uu_portal *p, uint8_t *frame, size_t length, uint64_t *revision) {
     if (!p || !frame) return 11;
+    uu_portal_dmabuf_disable(p);
     pthread_mutex_lock(&p->lock);
     int result = atomic_load(&p->closed) ? 9 : p->error ? p->error : stream_stalled(p) ? 9 :
         !p->sequence ? 10 : length != p->frame_length ? 11 : 0;
@@ -601,6 +866,36 @@ int uu_portal_capture_alive(struct uu_portal *p) {
     int alive = !stream_stalled(p);
     pthread_mutex_unlock(&p->lock);
     return alive;
+}
+int uu_portal_wait_frame(struct uu_portal *p, int64_t timeout_us) {
+    if (!p || atomic_load(&p->closed)) return -1;
+    pthread_mutex_lock(&p->lock);
+    if (p->error || atomic_load(&p->closed) || stream_stalled(p)) {
+        pthread_mutex_unlock(&p->lock);
+        return -1;
+    }
+    uint64_t prev_seq = p->sequence;
+    if (timeout_us <= 0) {
+        int ready = (p->sequence != prev_seq);
+        pthread_mutex_unlock(&p->lock);
+        return ready;
+    }
+    struct timespec until;
+    clock_gettime(CLOCK_MONOTONIC, &until);
+    until.tv_sec += timeout_us / 1000000LL;
+    until.tv_nsec += (long)(timeout_us % 1000000LL) * 1000L;
+    if (until.tv_nsec >= 1000000000L) {
+        until.tv_sec += 1;
+        until.tv_nsec -= 1000000000L;
+    }
+    while (p->sequence == prev_seq && !p->error && !atomic_load(&p->closed) && !stream_stalled(p)) {
+        int rc = pthread_cond_timedwait(&p->changed, &p->lock, &until);
+        if (rc != 0) break; // timeout or error
+    }
+    int res = (p->error || atomic_load(&p->closed) || stream_stalled(p)) ? -1 :
+              (p->sequence != prev_seq) ? 1 : 0;
+    pthread_mutex_unlock(&p->lock);
+    return res;
 }
 void uu_portal_input_dispatch(struct uu_portal *p) {
     if (p->ei) portal_eis_dispatch(p);
@@ -767,6 +1062,8 @@ int uu_portal_monitors(char *out, size_t length) {
  * captures then report a closed stream until the handle is replaced. */
 void uu_portal_end(struct uu_portal *p) {
     if (!p || atomic_exchange(&p->closed, 1)) return;
+    /* A closed session no longer tracks owner changes, so its cached claim is stale. */
+    pthread_mutex_lock(&p->lock); p->clipboard_owns=0; pthread_mutex_unlock(&p->lock);
     if (p->bus && p->session) {
         GVariant *reply = g_dbus_connection_call_sync(p->bus, DEST, p->session, SESSION, "Close",
             NULL, NULL, G_DBUS_CALL_FLAGS_NONE, 3000, NULL, NULL);

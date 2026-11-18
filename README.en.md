@@ -23,6 +23,21 @@
 <p align="center"><img src="docs/images/main-window.png" width="620" alt="Host main window: remote assistance and account"></p>
 <p align="center"><sub>Linux host main window: remote assistance and account (device ID, code and account redacted). The UI is available in Chinese and English (see [Language](#language--语言)).</sub></p>
 
+## Appearance / 外观
+
+Launcher icons use the system icon theme instead of emoji glyphs, so they do not depend on emoji font coverage.
+
+Signed-in graphical hosts report the system wallpaper for disconnected device cards in official clients
+(no desktop-window screenshot). GNOME/Cinnamon, KDE, Xfce and Omarchy on Hyprland are supported (following the current wallpaper); checks run every 60 seconds
+and unchanged content is not uploaded again. Other desktops can set `UU_WALLPAPER=/absolute/path/image.png`
+(PNG/JPEG/WebP). Set `UU_WALLPAPER_UPLOAD=0` to disable; guest and headless hosts skip reporting.
+See [protocol evidence and limitations](docs/wallpaper-protocol.md).
+
+Choose **System / Light / Dark** (default: System) in the viewer's **Settings → General → Appearance**, or via the gear settings button in host / tool windows.
+The choice is saved to `$XDG_CONFIG_HOME/uuremote/theme` (default `~/.config/uuremote/theme`).
+
+<p align="center"><img src="docs/images/appearance-light.png" width="360" alt="Light appearance (synthetic devices)"> <img src="docs/images/appearance-dark.png" width="360" alt="Dark appearance (synthetic devices)"></p>
+
 ## Language / 语言
 
 The language is picked once at start, in this order:
@@ -62,10 +77,11 @@ Protocol strings and messages that come from the UU servers are shown as the ser
 | Mac shortcuts | **Recommended**: turn off 「使用 macOS 快捷键」 (use macOS shortcuts) in the Mac viewer's remote-window menu; then Cmd+C/V/A/F/X/Z work as on a Mac (Cmd+C/V become Ctrl+Shift+C/V in terminals) and Ctrl+C always interrupts. With the option on, the viewer sends Cmd as Ctrl: in a terminal Ctrl+V / Cmd+V paste, Ctrl+C interrupts, copy is Cmd+Shift+C (X11) |
 | Pointer shape | Remote cursor shape is mirrored to the viewer (X11) |
 | Clipboard | Two-way text sync; Wayland mobile IME text inputs use clipboard paste fallback (see below) |
+| Viewer annotation | Strokes drawn with 「批注」 (annotate) in the viewer's watch mode appear on the Linux screen and stream back to the viewer (X11, needs a compositing manager; the overlay lets clicks through); cleared when annotation is turned off or the viewer disconnects. Verified with the Mac viewer 4.42.0; mobile viewers untested |
 | Quality / frame rate / resolution | Auto, Original 20M, Ultra 8M, HD 2M, custom; 30/60/90/144 fps; on X11 a resolution choice changes the desktop resolution itself like the official Windows host (xrandr, adding the mode when missing; restored for "original" or on disconnect), `UU_DESKTOP_RESIZE=0` scales in the encoder instead; Wayland scales in the encoder |
 | Sound | System audio captured from PulseAudio / PipeWire and sent as Opus |
-| File transfer | Upload, download (including folders), create folder, rename, delete |
-| Terminal | The official "Terminal" tool, PTY sessions, multiple sessions, rename |
+| File transfer | Upload, download (including folders), create folder, rename, delete; iOS quick uploads use the default receive directory (the current user’s home) |
+| Terminal | The official "Terminal" tool, PTY sessions, multiple sessions, rename, termination and automatic list refresh; input and detach messages from an old connection cannot affect a reattached session |
 | Lock state and auto unlock | Lock state is reported to the viewer; with "auto unlock" enabled in the client, the password is verified with PAM and the session is unlocked |
 | Lock after remote session | Stored on the host, so it still applies after reconnecting |
 | Mute host while controlled | Host speakers are muted while the viewer still hears the sound; the previous mute state is restored afterwards |
@@ -110,7 +126,11 @@ GNOME Portal CONTROL no longer waits for a consent dialog or the first video fra
 
 The host also accepts a desktop connection while GNOME is locked with no Portal session yet (a cold connection): it reports lock state and accepts auto unlock, then restores picture, input and clipboard after unlock. While Portal is pending, the host sends generated black video once per second on the negotiated track by default, allowing the official iPhone viewer to enter its auto-unlock flow without extra configuration. Verified on Ubuntu GNOME Wayland with the official Mac viewer; iPhone 4.42.0 with H.265 completed a same-executable control experiment: black video ON succeeded, OFF failed, and ON succeeded again ([#29](../../issues/29)). **Limitation**: this is synthetic black video, not the GNOME lock screen, and it does not enable native mouse/keyboard input while locked. Enable 「自动解锁被控端」 in the UU client under 控制中心 → 安全 and enter the password. Without saved Portal permission, local consent is still required after unlock before the real desktop can appear.
 
-Existing screen-off and lock settings remain unchanged. While a desktop viewer is connected the host holds a GNOME idle inhibitor, so an otherwise idle session does not auto-lock during a remote session; disconnecting or an initialization failure releases it. Manual lock remains effective. Desktop input is blocked and real video is hidden while locked or when lock state is unknown. Independent terminal, file-transfer and port-mapping peers do not wait for video initialization and survive desktop reconnection. Automated protocol and lifecycle regression tests cover this path; auto unlock and capture recovery after a cold locked connection are verified on GNOME hardware with the official Mac and iPhone 4.42.0 viewers, while screen-off and the other scenarios still need acceptance testing. Waking a fully suspended or hibernating machine is outside this CONTROL path.
+On KDE Plasma (KWin), the Portal screencast stays alive after the session locks. The host now opens capture while locked by default, so a cold connection shows the real lock screen and the password can be entered with the remote keyboard instead of receiving black video ([#227](../../issues/227), [#229](../../pull/229)). Set `UU_LOCKED_CAPTURE=0` to disable this and return to the black-video and auto-unlock path. Detection requires `XDG_CURRENT_DESKTOP` or `XDG_SESSION_DESKTOP` in the systemd user environment. Without either the host falls back to black video, and `UU_LOCKED_CAPTURE=1` forces the new behavior. Portal pointer input remains blocked while locked, and the keyboard uses uinput and can enter the password. This does not apply to GNOME: Mutter closes the Portal session on lock, so the black-video and auto-unlock behavior above is unchanged.
+
+Existing screen-off and lock settings remain unchanged. Only capture recovery in an unlocked session temporarily holds a GNOME idle inhibitor; the first frame, lock, disconnect or initialization failure releases it. An idle viewer still allows the normal screen-off and lock timeout, and manual lock remains effective. Portal input is blocked while locked. KDE keeps sending the real lock screen, while GNOME hides real video and uses black video. Independent terminal, file-transfer and port-mapping peers do not wait for video initialization and survive desktop reconnection. Automated protocol and lifecycle regression tests cover this path; auto unlock and capture recovery after a cold locked connection are verified on GNOME hardware with the official Mac and iPhone 4.42.0 viewers, while screen-off and the other scenarios still need acceptance testing. Waking a fully suspended or hibernating machine is outside this CONTROL path.
+
+Lock monitoring reads logind `LockedHint` over the system D-Bus and subscribes to changes instead of spawning `loginctl` every second. Without a graphical session it stays subscribed with unknown state, so login signals trigger a fresh read. It reconciles the session over D-Bus every 30 seconds; if D-Bus fails, it retries with a bounded `loginctl` fallback every 30 seconds, resolving the executable path once. Notifications may be delayed during fallback; unreadable state remains unknown. The locker must still report its state to logind. Suspend, locking and remote connection policies are unchanged.
 
 Locked black video requires FFmpeg's libx264/libx265 encoder for the negotiated H.264/H.265 codec; hardware encoding support alone does not satisfy this dependency. Encoder failures are logged explicitly. Synthetic video does not change capture permissions or advertised monitor dimensions. It pauses on unlock or unknown lock state, ends when capture is ready/rejected or the connection closes, and then hands the same video track to real capture. See [#29](../../issues/29) and [#34](../../pull/34) for the controlled experiment and validation scope.
 
@@ -144,8 +164,8 @@ On niri, `niri msg --json outputs` enumerates enabled monitors. Normal and 90/18
 | True color (4:4:4) | Supported (v0.1.15): the default FFmpeg pipeline with NVENC / libx264 encodes H.264 High 4:4:4; `inproc-av` native NVENC encodes H.264 High 4:4:4 / HEVC FRExt; VAAPI stays 4:2:0 and reports that to the client |
 | HDR | Not implemented |
 | Super screen / virtual display | Not implemented |
-| Privacy screen on the host | Not implemented |
-| Microphone (viewer audio played on the host) | Not implemented (needs a virtual sound card) |
+| Privacy screen on the host | Experimental: KDE Plasma Wayland (portal) supports picture and screen-off, and Mac 4.43.0 was verified for the off, picture and screen-off labels; `UU_PRIVACY_AUTO=picture` / `screen-off` enables it automatically on desktop connect. GNOME Wayland (portal) supports Mutter screen-off only and turns the display off again after local or remote input wakes it; full remote-control behavior is unverified; see [docs/privacy-screen.md](docs/privacy-screen.md) |
+| Microphone (viewer audio played on the host) | Experimental: Opus to a virtual input with `UU_MICROPHONE=1`; supports PulseAudio / PipeWire-pulse, see [notes](docs/remote-microphone.md) |
 | Plugins such as the WoW queue notifier | Not supported; the client is told that no plugins exist |
 | Linux login screen | The system login screen (before anyone logs in to the Linux desktop) cannot be controlled yet; use headless mode or a virtual desktop (see below). This is about the Linux login: **without a UU account** the host can now be used through remote assistance |
 | Relay connections on restrictive networks | Uses the ICE servers provided by the UU cloud; complex network setups are not thoroughly tested |
@@ -203,12 +223,15 @@ sudo apt install libwayland-dev libxkbcommon-dev wl-clipboard
 sudo apt install libglib2.0-dev libpipewire-0.3-dev libei-dev
 # optional: headers for the inproc-av VAAPI/DRI3 engines (libva itself is loaded at runtime)
 sudo apt install libva-dev libgbm-dev libx11-xcb-dev libxcb-dri3-dev libxcb-damage0-dev
+# In-process audio capture and Opus encoding for inproc-av
+sudo apt install libpulse-dev libopus-dev
 ```
 
 - A Rust toolchain is required (<https://rustup.rs>).
 - `libgtk-3-dev` is optional. Without GTK, login works with a QR code in the terminal (`UU_NO_GTK=1` disables
   the login window explicitly).
 - On NVIDIA GPUs use an FFmpeg build with `h264_nvenc`; otherwise the CPU encoder (libx264) is used.
+- The NVENC API version FFmpeg requires comes from the nv-codec-headers it was built against. For example, Arch's FFmpeg 9 is built against nv-codec-headers 13.1 and needs driver 610 or newer; Pascal (GTX 10 series) tops out at driver 580 with NVENC API 13.0, so the log shows `Driver does not support the required nvenc API version` and encoding falls back to the CPU. Build a separate FFmpeg against nv-codec-headers 13.0 into its own prefix and point `ffmpeg_root` in `config.json` at it (#230).
 
 ### 2. Build
 
@@ -220,6 +243,9 @@ cargo build --release --features wayland,portal   # + GNOME/KDE on Wayland
 
 The viewer's `viewer-ffmpeg` feature supports **FFmpeg 6.x only** (`pkg-config --modversion libavcodec` = 60.x); FFmpeg 7+ fails inside `ffmpeg-sys-next` with `avfft.h file not found` (#63).
 The host's optional `--features inproc-av` encodes with hardware inside the process on X11. It does not link FFmpeg development libraries; it loads the NVIDIA driver libraries (`libcuda.so.1`, `libnvidia-encode.so.1`) at runtime for NVENC (needs a driver with NVENC API 12.1, 530 or newer) and `libva.so.2`/`libva-drm.so.2` for VAAPI. When the capture and encoder sizes match, NVENC reads the XShm buffer directly, saving one host-to-device copy; VAAPI runs in process under the same feature (DRI3 DMA-BUF zero copy, or XShm upload without DRI3, then VPP to NV12 and VCN; H.264/HEVC). CPU encoding and `UU_CAPTURE=grab` keep the FFmpeg process; if the in-process hardware session fails it falls back to the matching FFmpeg process pipeline, then to the CPU. The default build and the release packages need neither feature.
+
+On GNOME/KDE Wayland, enable in-process encoding with `cargo build --release --features wayland,portal,inproc-av` and `set-encoder vaapi`; support is limited to Portal + VAAPI.
+`UU_PORTAL_DMABUF=0` disables DMA-BUF in favor of in-process host upload; `UU_VIDEO_PIPELINE=process` restores external FFmpeg pipelines.
 
 ### 3. Log in
 
@@ -284,6 +310,8 @@ sudo udevadm control --reload && sudo udevadm trigger --name-match=uinput
 
 `uaccess` grants access only to the user sitting at the machine. `UU_INPUT_BACKEND=uinput|native` forces a backend.
 X11 keeps XTest by default because it handles held keys correctly on high-latency links.
+
+ASCII text mapping through uinput requires X11/XWayland XKB; unmappable text keeps the existing text/clipboard path.
 
 ## Remote assistance and the main window (experimental)
 
@@ -362,6 +390,8 @@ Common environment variables:
 | Variable | Purpose |
 |---|---|
 | `UU_CONFIG` | Config file path (default `~/.config/uuremote/config.json`) |
+| `UU_CLIENT_VERSION` | Reported host client version (`x-param-vn` and User-Agent), default `4.45.0.4318`; corresponds to `client_version` in config file, environment variable takes precedence |
+| `UU_VERSION_CODE` | Reported host version code (`x-param-vc`), default `4318`; corresponds to `version_code` in config file, environment variable takes precedence |
 | `UU_DESKTOP_BACKEND` | `auto` / `x11` / `wayland` / `portal` / `kms` (experimental feature) / `none` (headless) |
 | `UU_DESKTOP_RESIZE=0` | on X11, keep the desktop resolution and only scale the encoded stream when the viewer picks a resolution |
 | `UU_NVENC_RGB=0` / `=1` | NVENC encodes BGRA directly (saves CPU). Off by default when a monitor is connected to the NVIDIA card (slower when the desktop is composited on the same GPU); `0` forces off, `1` forces on |
@@ -371,17 +401,18 @@ Common environment variables:
 | `UU_X11_OUTPUT` | Initial X11 monitor name (`xrandr --listmonitors`); default: the primary |
 | `UU_WAYLAND_NO_VIRTUAL_KEYBOARD=1` | Native Wayland skips the virtual keyboard (e.g. Denial reserves it for its input method); keys go through uinput. Without wlr-virtual-pointer the pointer also uses uinput (#72) |
 | `UU_INPUT_BACKEND` | `auto` (default: uinput on Wayland when accessible) / `uinput` / `native` |
+| `UU_PORTAL_CURSOR_MODE` | Startup cursor mode: `embedded` draws the compositor pointer into the stream; hidden by default. The host switches at runtime as the viewer sends relative or absolute motion. A switch rebuilds the portal session and interrupts picture and input for a moment |
 | `UU_TERMINAL_SHORTCUTS=0` | Disable the Ctrl+V paste rewrite in terminal windows |
 | `UU_VIDEO_ENCODER` | `cpu`: libx264; `vaapi`: opt-in Intel/AMD; `nvenc`: force NVENC; unset or `auto`: a background probe (one synthetic IDR per candidate, 3 s each). With an NVIDIA driver the order is NVENC then CPU; without one the only candidate is CPU and the probe is skipped. A session that starts before the probe finishes uses the previous rule (NVENC if NVIDIA is present, else CPU). On a self-built `--features inproc-av` binary, a process-only failure of NVENC when the in-process engine would try it first on X11 is logged `native_unprobed` and keeps the previous NVENC choice (Wayland, portal, and KMS fall back to CPU). The skipped CPU-only probe is logged `not probed (only candidate)`. A successful probe and that CPU-only skip stay cached while NVIDIA presence matches the report. A later desktop connection whose presence differs starts one background re-probe and still uses the cached encoder until the new result is stored. A hardware-candidate failure (NVENC failed, CPU chosen) is kept for 10 minutes; the next desktop connection after that starts the same re-probe and still uses the cached encoder until the new result is stored. Explicit `cpu` / `vaapi` / `nvenc` does not start the probe. Another failure restarts the 10 minutes. `native_unprobed` is not a temporary failure. A non-`auto` `video_encoder` in `host_settings.json` wins. VAAPI stays out of auto until #33 |
 | `UU_VAAPI_BUFFER_MS` | VAAPI VBV buffer in ms (10-1000, VAAPI only); raise it when keyframes are squeezed into a blur at high resolution |
-| `UU_NVENC_BUFFER_MS` | NVENC VBV buffer in ms (10-1000, NVENC only, including the in-process engine); the default is 100-500 kbit, set `1000` when high-resolution keyframes blur and flicker once per GOP (#103) |
+| `UU_NVENC_BUFFER_MS` | NVENC VBV buffer in ms (10-1000, NVENC only, including the in-process engine); the default matches libx264, one second of the bitrate cap within 500-8000 kbit, so high-resolution keyframes no longer blur and flicker once per GOP (#103). Set a small value (e.g. `50`) for a smaller low-latency buffer on a weak link |
 | `UU_FFMPEG_ROOT` | Use FFmpeg from this prefix |
 | `UU_AUDIO=0` | Disable sound; `UU_AUDIO_SOURCE` picks the PulseAudio source |
 | `UU_REMOTE_ASSIST=0` | Disable remote assistance (no guest assistance before sign-in either) |
 | `UU_ASSIST_ALLOW=1` | Allow remote assistance at start (overrides the saved switch) |
 | `UU_LOGIN_WINDOW=0` | Do not open the login window automatically when credentials are missing |
 | `UU_PORT_MAPPING=0` | Disable port mapping (the official host's controlled-side switch) |
-| `UU_WOL_HELPER=1` | Experimental: act as a remote-boot helper like the official Windows host — report this host's LAN info after sign-in and send a magic packet to the LAN when the cloud asks to wake a PC (not verified end to end) |
+| `UU_WOL_HELPER=1` | Experimental: act as a remote-boot helper like the official Windows host — report this host's LAN info after sign-in and send a magic packet to the LAN when the cloud asks to wake a PC (verified end to end with a headless Linux host on a NAS and the official iOS controller) |
 | `UU_USE_PROXY=1` | Share environment HTTP/HTTPS proxy policy between REST and host/viewer WebSocket signaling; proxies are ignored by default |
 
 
@@ -444,6 +475,7 @@ flowchart LR
 
 ## Security and privacy
 
+- By default, signed-in graphical hosts upload the current wallpaper image to UU's file service for device-card backgrounds. Set `UU_WALLPAPER_UPLOAD=0` to disable this upload.
 - Logs never contain keystrokes, terminal text, clipboard contents, file contents, passwords or tokens.
 - For auto unlock the password is stored in the **viewer** (the official client). The host only checks it
   once with PAM; it is never written to disk or logs.
@@ -579,6 +611,8 @@ No official "no desktop" error code was found for headless desktop offers, so th
 
 ## Experimental native viewer (uuremote-viewer)
 
+See [SDL viewer video scheduling](docs/viewer-video-scheduling.md).
+
 `uuremote-viewer` is a Linux **viewer/controller**: it connects to and controls other devices on your UU account (official Windows / Mac
 hosts or this project's Linux host), and can start remote assistance with someone's device ID and code. It is experimental and
 separate from the host `uuremote-server`; the default host build and behaviour are unchanged.
@@ -588,8 +622,13 @@ separate from the host `uuremote-server`; the default host build and behaviour a
 terminal emulator (`TERMINAL` selects one). From source: `sudo apt install libsdl2-dev`, then
 `cargo build --release --locked --features native-viewer,viewer-sdl --bin uuremote-viewer`.
 
+Key combinations use the left/right modifier state attached to each SDL key event. Focus loss releases remote keys; after focus returns, the next non-modifier key restores any still-held Shift/Ctrl/Alt/Win (Command on Mac). This is built in, with no adapter or setting required.
+
+The viewer mirrors remote PNG pointer shapes (including text and window-resize cursors) with their hotspots. Leaving the remote picture or opening local controls restores the local arrow.
+
 SDL clipboard access reuses the desktop window to avoid temporary-window Dock churn on GNOME Wayland (#37).
-Synchronization runs only while that window is focused and keeps the 30 KiB text limit. Selections without a supported
+On niri, data-control-capable `wl-clipboard` is used instead, so synchronization does not require window focus.
+Other SDL backends synchronize only while that window is focused. The 30 KiB text limit applies. Selections without a supported
 text format are skipped; empty-text detection depends on the SDL2 backend. Builds without SDL retain the command backend.
 SDL2 reads selections synchronously, so a slow selection owner can temporarily block the window; the bridge timeout cannot interrupt it.
 GNOME-to-official-Mac bidirectional clipboard synchronization is still unverified; this change does not resolve host compatibility.
@@ -623,6 +662,8 @@ GNOME-to-official-Mac bidirectional clipboard synchronization is still unverifie
 - Frames are decoded at the host's native resolution and scaled to the window with linear filtering; a host resolution
   change restarts the decoder. `UU_VIEWER_SIZE=WxH` forces a fixed letterboxed canvas instead.
 
+The SDL remote desktop window disables local IME text composition and forwards physical keys; use the remote host’s input method and its language toggle (for example, Shift) to enter Chinese.
+
 Mac targets use native macOS keycodes; Windows / Linux targets retain Windows VK. Keys follow physical positions, without
 automatically translating Ctrl to Command; on a Mac target the PC Super / Windows key acts as Command. Only verified target
 platform values 1 (Windows / this project's Linux host) and 4 (Mac) are accepted; unknown values fail explicitly. Account
@@ -647,3 +688,11 @@ assistance and ISO / JIS keyboards have not been tested live.
 
 "—" = not tested yet. Only use reboot/shutdown on machines you can restart. **Not tested live**: H.265 / 4:4:4 with official hosts, multiple monitors. Logs carry field
 numbers, sizes and states only, never keystrokes, clipboard or file contents, codes or credentials.
+
+### Native gamepad and rumble (experimental)
+
+The SDL viewer forwards one mapped controller and ordinary two-motor rumble through the existing desktop CONTROL channel to a Windows host.
+Default OFF: set `UU_VIEWER_NATIVE_GAMEPAD=1` to enable input; `UU_VIEWER_NATIVE_RUMBLE=0` disables feedback independently.
+Guide forwarding, multiple controllers and adaptive triggers are unsupported; suspend, forced exit and network recovery are not comprehensively verified.
+One reporting user tested input, phone-hotspot WAN, reconnect and rumble on one Windows/Steam Deck pair.
+See [protocol evidence, design and limits](docs/deckpad-native-gamepad.md).
